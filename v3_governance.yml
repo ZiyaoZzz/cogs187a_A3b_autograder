@@ -24,7 +24,10 @@ canonical_files:
   - "README.md"                 # Project documentation
 
 # Paths that can be empty or contain stub files (hollow)
+# Note: Critical code roots that don't contain Python files should be listed here
 hollow_paths_allowlist:
+  - "src"                       # React frontend (TypeScript/TSX, no Python files)
+  - "rubrics"                   # Grading rubrics (JSON files, no Python files)
   - "submissions/**"            # Student submissions (may be empty)
   - "output_static/**"          # Generated output (may be empty)
   - "node_modules/**"           # npm dependencies (managed by npm)
