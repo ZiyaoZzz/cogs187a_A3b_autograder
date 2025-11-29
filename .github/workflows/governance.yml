@@ -1,0 +1,81 @@
+name: Governance Guards
+
+on:
+  push:
+    branches: [ main, master, develop ]
+  pull_request:
+    branches: [ main, master, develop ]
+
+jobs:
+  governance:
+    name: Run Governance Guards
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          pip install -r requirements.txt
+      
+      - name: Verify governance configuration exists
+        run: |
+          if [ ! -f "v3_governance.yml" ]; then
+            echo "❌ Error: v3_governance.yml not found"
+            exit 1
+          fi
+          if [ ! -f "governance.lock" ]; then
+            echo "⚠️  Warning: governance.lock not found"
+          fi
+          echo "✅ Governance configuration files found"
+      
+      - name: Run Hollow Repo Guard
+        run: |
+          python scripts/hollow_repo_guard.py
+      
+      - name: Run Program Integrity Guard
+        run: |
+          python scripts/program_integrity_guard.py
+      
+      - name: Run Syntax Guard
+        run: |
+          python scripts/syntax_guard.py
+      
+      - name: Run Critical Import Guard
+        run: |
+          python scripts/critical_import_guard.py
+      
+      - name: Run Canon Guard
+        run: |
+          python scripts/canon_guard.py
+      
+      - name: Verify critical imports
+        run: |
+          python -c "from backend.main import app"
+          echo "✅ Critical imports verified"
+      
+      - name: Check critical files exist
+        run: |
+          if [ ! -f "backend/main.py" ]; then
+            echo "❌ Error: backend/main.py not found (critical file)"
+            exit 1
+          fi
+          if [ ! -f "rubrics/a3_rubric.json" ]; then
+            echo "⚠️  Warning: rubrics/a3_rubric.json not found"
+          fi
+          echo "✅ Critical files verified"
+      
+      - name: Summary
+        if: always()
+        run: |
+          echo "✅ All governance guards completed"
+          echo "If any guard failed above, this PR should not be merged."
+

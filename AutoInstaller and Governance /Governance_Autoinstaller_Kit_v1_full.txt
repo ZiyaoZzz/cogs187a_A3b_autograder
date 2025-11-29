@@ -1,0 +1,949 @@
+#!/usr/bin/env python
+"""Deconcatenate a concatenated repo file for the Governance + Autoinstaller Kit.
+
+Usage:
+    python deconcat.py <input.txt> <output_dir>
+
+This script reconstructs files from a concatenated dump that uses markers:
+
+    ----- FILE PATH: <relpath>
+    ----- CONTENT START -----
+    ... file content ...
+    ----- CONTENT END -----
+
+The script is self-contained and does not require any third-party dependencies.
+"""
+
+import sys
+from pathlib import Path
+
+
+MARKER_PATH = "----- FILE PATH:"
+MARKER_START = "----- CONTENT START -----"
+MARKER_END = "----- CONTENT END -----"
+
+
+def deconcat(input_path: str, output_dir: str) -> None:
+    src = Path(input_path)
+    out_root = Path(output_dir)
+    out_root.mkdir(parents=True, exist_ok=True)
+
+    current_relpath = None
+    current_lines = []
+    state = "idle"
+
+    with src.open("r", encoding="utf-8") as f:
+        for raw_line in f:
+            line = raw_line.rstrip("\n")
+
+            if line.startswith(MARKER_PATH):
+                # Flush any pending file.
+                if current_relpath is not None and current_lines:
+                    _write_file(out_root, current_relpath, current_lines)
+                current_relpath = line[len(MARKER_PATH):].strip()
+                current_lines = []
+                state = "await_start"
+                continue
+
+            if line == MARKER_START:
+                state = "in_file"
+                continue
+
+            if line == MARKER_END:
+                if current_relpath is not None:
+                    _write_file(out_root, current_relpath, current_lines)
+                current_relpath = None
+                current_lines = []
+                state = "idle"
+                continue
+
+            if state == "in_file":
+                current_lines.append(raw_line)
+
+    # Flush at EOF if needed.
+    if current_relpath is not None and current_lines:
+        _write_file(out_root, current_relpath, current_lines)
+
+
+def _write_file(root: Path, relpath: str, lines) -> None:
+    target = root / relpath
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with target.open("w", encoding="utf-8") as f:
+        for line in lines:
+            f.write(line)
+
+
+if __name__ == "__main__":
+    if len(sys.argv) != 3:
+        print("Usage: python deconcat.py <input.txt> <output_dir>")
+        sys.exit(1)
+    deconcat(sys.argv[1], sys.argv[2])
+
+
+
+----- FILE PATH: VERSION
+----- CONTENT START -----
+0.1.0
+----- CONTENT END -----
+
+----- FILE PATH: v3_governance.yml
+----- CONTENT START -----
+# Generic governance spec for the Governance + Autoinstaller Kit.
+# Adapt this file in each target repo.
+version: 3
+project_name: "MyProject"
+root_package: "backend"
+
+critical_code_roots:
+  - "backend"
+  - "scripts"
+
+canonical_files:
+  - "VERSION"
+  - "v3_governance.yml"
+  - "release.keep.yml"
+  - "install.sh"
+
+stub_allowlist:
+  - "experiments/**"
+  - "notebooks/**"
+
+hollow_paths_allowlist:
+  - "docs/**"
+  - "experiments/**"
+
+critical_imports:
+  - "backend.main:app"
+
+entrypoints:
+  api:
+    module: "backend.main"
+    object: "app"
+----- CONTENT END -----
+
+----- FILE PATH: governance.lock
+----- CONTENT START -----
+governance_version: 3
+locked_at: "2025-11-24"
+notes: >
+  Baseline governance lock for the Governance + Autoinstaller Kit template.
+  When adapting this kit to a real project, update this file after you have
+  consciously revised v3_governance.yml and validated the new invariants.
+----- CONTENT END -----
+
+----- FILE PATH: release.keep.yml
+----- CONTENT START -----
+keep:
+  - "VERSION"
+  - "v3_governance.yml"
+  - "governance.lock"
+  - "release.keep.yml"
+  - "install.sh"
+  - "scripts"
+  - "docs"
+----- CONTENT END -----
+
+----- FILE PATH: install.sh
+----- CONTENT START -----
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROJECT_NAME="${PROJECT_NAME:-MyProject}"
+LOG_DIR="${LOG_DIR:-logs}"
+REQUIRE_DOCKER="${REQUIRE_DOCKER:-0}"
+
+mkdir -p "$LOG_DIR"
+LOG_FILE="$LOG_DIR/install_$(date +%s).log"
+
+# Dual logging: console + file
+exec > >(tee -i "$LOG_FILE") 2>&1
+
+echo "==> [$PROJECT_NAME] Starting install at $(date)"
+
+# 1. Find Python
+PYTHON_CMD=$(command -v python3 || command -v python || true)
+if [ -z "${PYTHON_CMD}" ]; then
+  echo "❌ Critical: No python or python3 found on PATH."
+  exit 1
+fi
+echo "Using Python: ${PYTHON_CMD}"
+
+# 2. Ensure venv
+if [ -z "${VIRTUAL_ENV:-}" ]; then
+  echo "⚠️  No virtualenv detected. Creating .venv at repo root..."
+  "${PYTHON_CMD}" -m venv .venv
+  # shellcheck disable=SC1091
+  source .venv/bin/activate
+  echo "✅ Activated .venv"
+else
+  echo "✅ Running inside existing virtualenv: $VIRTUAL_ENV"
+fi
+
+# 3. Optional Docker check
+if [ "${REQUIRE_DOCKER}" -eq 1 ]; then
+  if ! command -v docker >/dev/null 2>&1; then
+    echo "❌ Fatal: Docker is required but not found. Set REQUIRE_DOCKER=0 to skip."
+    exit 1
+  fi
+  echo "✅ Docker is available"
+fi
+
+# 4. Install Python dependencies (adapt as needed)
+if [ -f "requirements.txt" ]; then
+  echo "==> Installing requirements.txt..."
+  pip install -r requirements.txt
+elif [ -f "pyproject.toml" ]; then
+  echo "==> Detected pyproject.toml. Please install dependencies with your chosen tool (poetry/pip)."
+else
+  echo "==> No requirements.txt or pyproject.toml found; skipping dependency install."
+fi
+
+# 5. Run governance guards
+echo "==> Running governance guards..."
+python scripts/hollow_repo_guard.py
+python scripts/program_integrity_guard.py
+python scripts/syntax_guard.py
+python scripts/critical_import_guard.py
+python scripts/canon_guard.py
+
+# 6. Project-specific steps (examples; adapt in your repo)
+echo "==> Running project-specific setup steps (customize in your repo)..."
+# Example:
+# if [ -f "manage.py" ]; then
+#   python manage.py migrate
+# fi
+# if [ -f "alembic.ini" ]; then
+#   alembic upgrade head
+# fi
+# if [ -f "pytest.ini" ] || [ -d "tests" ]; then
+#   pytest
+# fi
+
+echo "✅ [$PROJECT_NAME] Install completed successfully."
+----- CONTENT END -----
+
+----- FILE PATH: README.md
+----- CONTENT START -----
+# Governance + Autoinstaller Kit (v0.1.0)
+
+This kit packages a hardened `install.sh` and a small Governance / Rot Shield
+module that you can drop into any Python-based project. It is designed to be
+easy for both humans and AI assistants to integrate into existing repos.
+
+## Contents
+
+- `install.sh`
+  - Strict-mode autoinstaller.
+  - Creates / activates a virtualenv.
+  - Optionally asserts that Docker is available.
+  - Runs a sequence of governance guards.
+  - Leaves space for project-specific migrations/tests.
+
+- `v3_governance.yml`
+  - Declarative governance specification:
+    - Critical code roots.
+    - Canonical files.
+    - Stub/hollow allowlists.
+    - Critical imports and entrypoints.
+
+- `governance.lock`
+  - Frozen snapshot of governance version and notes.
+  - Update this file only after consciously revising `v3_governance.yml`.
+
+- `release.keep.yml`
+  - Keep-list for drift-shield / orphan-sweeper tools.
+
+- `scripts/`
+  - `hollow_repo_guard.py`
+  - `program_integrity_guard.py`
+  - `syntax_guard.py`
+  - `critical_import_guard.py`
+  - `canon_guard.py`
+  - `guardian.py` — runs all guards in sequence.
+  - `rot_audit_prompt.py` — prints a rot-focused Ruthless prompt.
+
+- `docs/`
+  - `GOVERNANCE_KIT_README.md`
+  - `ROT_RUTHLESS_PROMPT.md`
+  - `RUTHLESS_MULTIPANEL_PROMPT.md`
+
+## Quick Start (for a target repo)
+
+1. Copy the kit contents into your repo root (or add as a subtree).
+2. Edit `v3_governance.yml`:
+   - Set `project_name`, `root_package`, `critical_code_roots`,
+     `canonical_files`, and `critical_imports`.
+3. Adjust `install.sh`:
+   - Confirm the dependency section matches your project
+     (`requirements.txt`, `pyproject.toml`, or other).
+   - Add your migrations/tests in the "project-specific steps" section.
+4. Run:
+   - `chmod +x install.sh`
+   - `./install.sh`
+
+If any guard fails, it will print a clear error and exit non-zero.
+
+## Using the Rot Audit Prompt
+
+- Run `python scripts/rot_audit_prompt.py` to print a fully-assembled
+  "Rot Tribunal" prompt that includes your project name, code roots,
+  and governance spec.
+- Paste that prompt into an LLM and follow its recommendations, then
+  update your code and re-run `./install.sh`.
+
+----- CONTENT END -----
+
+----- FILE PATH: scripts/hollow_repo_guard.py
+----- CONTENT START -----
+#!/usr/bin/env python
+"""hollow_repo_guard.py
+
+Fails if any critical code root is effectively "hollow" (no real Python files),
+unless it is explicitly allowed in v3_governance.yml.
+"""
+
+import sys
+from pathlib import Path
+
+import yaml
+
+
+def load_governance(root: Path) -> dict:
+    cfg_path = root / "v3_governance.yml"
+    if not cfg_path.exists():
+        print("hollow_repo_guard: v3_governance.yml not found", file=sys.stderr)
+        sys.exit(1)
+    return yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+
+
+def is_under(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def main(argv=None) -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    cfg = load_governance(repo_root)
+
+    critical_roots = [repo_root / p for p in cfg.get("critical_code_roots", [])]
+    hollow_allowlist = cfg.get("hollow_paths_allowlist", [])
+
+    import fnmatch
+
+    def is_hollow_allowed(path: Path) -> bool:
+        rel = path.relative_to(repo_root).as_posix()
+        return any(fnmatch.fnmatch(rel, pattern) for pattern in hollow_allowlist)
+
+    errors = []
+
+    for root in critical_roots:
+        if not root.exists():
+            errors.append(f"Critical code root does not exist: {root}")
+            continue
+
+        py_files = [p for p in root.rglob("*.py") if p.name != "__init__.py"]
+        if not py_files and not is_hollow_allowed(root):
+            errors.append(
+                f"Critical code root appears hollow (no .py files): {root}"
+            )
+
+    if errors:
+        print("hollow_repo_guard: FAIL", file=sys.stderr)
+        for msg in errors:
+            print(" -", msg, file=sys.stderr)
+        sys.exit(1)
+
+    print("hollow_repo_guard: OK")
+
+
+if __name__ == "__main__":
+    main()
+----- CONTENT END -----
+
+----- FILE PATH: scripts/program_integrity_guard.py
+----- CONTENT START -----
+#!/usr/bin/env python
+"""program_integrity_guard.py
+
+Enforces basic program integrity:
+- No stray "..." ellipses in code bodies.
+- `# STUB:` markers only allowed under stub_allowlist paths.
+"""
+
+import sys
+from pathlib import Path
+import fnmatch
+
+import yaml
+
+
+def load_governance(root: Path) -> dict:
+    cfg_path = root / "v3_governance.yml"
+    if not cfg_path.exists():
+        print("program_integrity_guard: v3_governance.yml not found", file=sys.stderr)
+        sys.exit(1)
+    return yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+
+
+def main(argv=None) -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    cfg = load_governance(repo_root)
+
+    critical_roots = [repo_root / p for p in cfg.get("critical_code_roots", [])]
+    stub_allowlist = cfg.get("stub_allowlist", [])
+
+    def path_allowed_for_stubs(path: Path) -> bool:
+        rel = path.relative_to(repo_root).as_posix()
+        return any(fnmatch.fnmatch(rel, pattern) for pattern in stub_allowlist)
+
+    errors = []
+
+    for root in critical_roots:
+        if not root.exists():
+            continue
+        for py in root.rglob("*.py"):
+            try:
+                text = py.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                continue
+
+            rel = py.relative_to(repo_root).as_posix()
+            allow_stubs_here = path_allowed_for_stubs(py)
+
+            for lineno, line in enumerate(text.splitlines(), start=1):
+                stripped = line.strip()
+
+                # Disallow "..." in non-comment lines.
+                if "..." in stripped and not stripped.startswith("#"):
+                    errors.append(
+                        f"{rel}:{lineno} contains '...' in code; ellipsis is not allowed."
+                    )
+
+                # Disallow # STUB: where not allowed.
+                if stripped.startswith("# STUB:") and not allow_stubs_here:
+                    errors.append(
+                        f"{rel}:{lineno} uses '# STUB:' outside stub_allowlist."
+                    )
+
+    if errors:
+        print("program_integrity_guard: FAIL", file=sys.stderr)
+        for msg in errors:
+            print(" -", msg, file=sys.stderr)
+        sys.exit(1)
+
+    print("program_integrity_guard: OK")
+
+
+if __name__ == "__main__":
+    main()
+----- CONTENT END -----
+
+----- FILE PATH: scripts/syntax_guard.py
+----- CONTENT START -----
+#!/usr/bin/env python
+"""syntax_guard.py
+
+Compiles all Python files under critical_code_roots to ensure there are no
+syntax errors.
+"""
+
+import sys
+from pathlib import Path
+import compileall
+
+import yaml
+
+
+def load_governance(root: Path) -> dict:
+    cfg_path = root / "v3_governance.yml"
+    if not cfg_path.exists():
+        print("syntax_guard: v3_governance.yml not found", file=sys.stderr)
+        sys.exit(1)
+    return yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+
+
+def main(argv=None) -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    cfg = load_governance(repo_root)
+
+    critical_roots = [repo_root / p for p in cfg.get("critical_code_roots", [])]
+
+    ok = True
+    for root in critical_roots:
+        if not root.exists():
+            continue
+        result = compileall.compile_dir(root, quiet=1)
+        if not result:
+            ok = False
+
+    if not ok:
+        print("syntax_guard: FAIL (one or more packages failed to compile)", file=sys.stderr)
+        sys.exit(1)
+
+    print("syntax_guard: OK")
+
+
+if __name__ == "__main__":
+    main()
+----- CONTENT END -----
+
+----- FILE PATH: scripts/critical_import_guard.py
+----- CONTENT START -----
+#!/usr/bin/env python
+"""critical_import_guard.py
+
+Ensures that critical imports specified in v3_governance.yml can be imported.
+"""
+
+import importlib
+import sys
+from pathlib import Path
+
+import yaml
+
+
+def load_governance(root: Path) -> dict:
+    cfg_path = root / "v3_governance.yml"
+    if not cfg_path.exists():
+        print("critical_import_guard: v3_governance.yml not found", file=sys.stderr)
+        sys.exit(1)
+    return yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+
+
+def main(argv=None) -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    sys.path.insert(0, str(repo_root))
+
+    cfg = load_governance(repo_root)
+    imports = cfg.get("critical_imports", [])
+
+    errors = []
+
+    for item in imports:
+        if ":" in item:
+            mod_name, attr_name = item.split(":", 1)
+        else:
+            mod_name, attr_name = item, None
+
+        try:
+            module = importlib.import_module(mod_name)
+        except Exception as exc:
+            errors.append(f"Failed to import module '{mod_name}': {exc}")
+            continue
+
+        if attr_name:
+            if not hasattr(module, attr_name):
+                errors.append(
+                    f"Module '{mod_name}' is missing required attribute '{attr_name}'."
+                )
+
+    if errors:
+        print("critical_import_guard: FAIL", file=sys.stderr)
+        for msg in errors:
+            print(" -", msg, file=sys.stderr)
+        sys.exit(1)
+
+    print("critical_import_guard: OK")
+
+
+if __name__ == "__main__":
+    main()
+----- CONTENT END -----
+
+----- FILE PATH: scripts/canon_guard.py
+----- CONTENT START -----
+#!/usr/bin/env python
+"""canon_guard.py
+
+Verifies that canonical files specified in v3_governance.yml exist and, where
+applicable, are non-empty.
+"""
+
+import sys
+from pathlib import Path
+
+import yaml
+
+
+def load_governance(root: Path) -> dict:
+    cfg_path = root / "v3_governance.yml"
+    if not cfg_path.exists():
+        print("canon_guard: v3_governance.yml not found", file=sys.stderr)
+        sys.exit(1)
+    return yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+
+
+def main(argv=None) -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    cfg = load_governance(repo_root)
+
+    canonical_files = cfg.get("canonical_files", [])
+    errors = []
+
+    for rel in canonical_files:
+        path = repo_root / rel
+        if not path.exists():
+            errors.append(f"Canonical file missing: {rel}")
+        elif path.is_file():
+            try:
+                content = path.read_text(encoding="utf-8").strip()
+            except UnicodeDecodeError:
+                content = ""
+            if rel == "VERSION" and not content:
+                errors.append("VERSION file exists but is empty.")
+
+    if errors:
+        print("canon_guard: FAIL", file=sys.stderr)
+        for msg in errors:
+            print(" -", msg, file=sys.stderr)
+        sys.exit(1)
+
+    print("canon_guard: OK")
+
+
+if __name__ == "__main__":
+    main()
+----- CONTENT END -----
+
+----- FILE PATH: scripts/guardian.py
+----- CONTENT START -----
+#!/usr/bin/env python
+"""guardian.py
+
+Convenience runner that executes all governance guards in sequence.
+"""
+
+import subprocess
+import sys
+from pathlib import Path
+
+
+GUARDS = [
+    "hollow_repo_guard.py",
+    "program_integrity_guard.py",
+    "syntax_guard.py",
+    "critical_import_guard.py",
+    "canon_guard.py",
+]
+
+
+def main(argv=None) -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    python = sys.executable
+
+    for guard in GUARDS:
+        guard_path = repo_root / "scripts" / guard
+        if not guard_path.exists():
+            print(f"guardian: guard script missing: {guard}", file=sys.stderr)
+            sys.exit(1)
+        print(f"==> Running {guard}...")
+        result = subprocess.run([python, str(guard_path)])
+        if result.returncode != 0:
+            print(
+                f"guardian: {guard} failed with exit code {result.returncode}",
+                file=sys.stderr,
+            )
+            sys.exit(result.returncode)
+
+    print("✅ guardian: All governance guards passed.")
+
+
+if __name__ == "__main__":
+    main()
+----- CONTENT END -----
+
+----- FILE PATH: scripts/rot_audit_prompt.py
+----- CONTENT START -----
+#!/usr/bin/env python
+"""rot_audit_prompt.py
+
+Prints a rot-focused Ruthless prompt, pre-filled with project-specific
+information from v3_governance.yml. This is meant to be pasted into an LLM.
+"""
+
+import sys
+from pathlib import Path
+
+import yaml
+
+
+def load_governance(root: Path) -> dict:
+    cfg_path = root / "v3_governance.yml"
+    if not cfg_path.exists():
+        raise SystemExit("rot_audit_prompt: v3_governance.yml not found")
+    return yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+
+
+def load_prompt_template(root: Path) -> str:
+    tmpl_path = root / "docs" / "ROT_RUTHLESS_PROMPT.md"
+    if not tmpl_path.exists():
+        raise SystemExit("rot_audit_prompt: docs/ROT_RUTHLESS_PROMPT.md not found")
+    return tmpl_path.read_text(encoding="utf-8")
+
+
+def main(argv=None) -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    cfg = load_governance(repo_root)
+    tmpl = load_prompt_template(repo_root)
+
+    project_name = cfg.get("project_name", "UnknownProject")
+    root_package = cfg.get("root_package", "backend")
+    critical_roots = cfg.get("critical_code_roots", [])
+    canonical_files = cfg.get("canonical_files", [])
+    critical_imports = cfg.get("critical_imports", [])
+
+    header = [
+        "# Rot Tribunal Context Block",
+        "",
+        f"- Project name: {project_name}",
+        f"- Root package: {root_package}",
+        f"- Critical code roots: {', '.join(critical_roots) if critical_roots else '(none)'}",
+        f"- Canonical files: {', '.join(canonical_files) if canonical_files else '(none)'}",
+        f"- Critical imports: {', '.join(critical_imports) if critical_imports else '(none)'}",
+        "",
+        "---",
+        "",
+    ]
+
+    sys.stdout.write("\n".join(header))
+    sys.stdout.write(tmpl)
+
+
+if __name__ == "__main__":
+    main()
+----- CONTENT END -----
+
+----- FILE PATH: scripts/__pycache__/canon_guard.cpython-311.pyc
+----- CONTENT START -----
+[BINARY FILE OMITTED: scripts/__pycache__/canon_guard.cpython-311.pyc]
+----- CONTENT END -----
+
+----- FILE PATH: scripts/__pycache__/critical_import_guard.cpython-311.pyc
+----- CONTENT START -----
+[BINARY FILE OMITTED: scripts/__pycache__/critical_import_guard.cpython-311.pyc]
+----- CONTENT END -----
+
+----- FILE PATH: scripts/__pycache__/guardian.cpython-311.pyc
+----- CONTENT START -----
+[BINARY FILE OMITTED: scripts/__pycache__/guardian.cpython-311.pyc]
+----- CONTENT END -----
+
+----- FILE PATH: scripts/__pycache__/hollow_repo_guard.cpython-311.pyc
+----- CONTENT START -----
+[BINARY FILE OMITTED: scripts/__pycache__/hollow_repo_guard.cpython-311.pyc]
+----- CONTENT END -----
+
+----- FILE PATH: scripts/__pycache__/program_integrity_guard.cpython-311.pyc
+----- CONTENT START -----
+[BINARY FILE OMITTED: scripts/__pycache__/program_integrity_guard.cpython-311.pyc]
+----- CONTENT END -----
+
+----- FILE PATH: scripts/__pycache__/rot_audit_prompt.cpython-311.pyc
+----- CONTENT START -----
+[BINARY FILE OMITTED: scripts/__pycache__/rot_audit_prompt.cpython-311.pyc]
+----- CONTENT END -----
+
+----- FILE PATH: scripts/__pycache__/syntax_guard.cpython-311.pyc
+----- CONTENT START -----
+[BINARY FILE OMITTED: scripts/__pycache__/syntax_guard.cpython-311.pyc]
+----- CONTENT END -----
+
+----- FILE PATH: docs/GOVERNANCE_KIT_README.md
+----- CONTENT START -----
+# Governance + Autoinstaller Kit — Detailed Guide
+
+This document explains how to adapt the kit to a real project. It is written
+to be "AI-complete": an LLM can follow these instructions to integrate the
+kit without additional context.
+
+## 1. Determine the repo root
+
+1. Look for:
+   - `.git` directory.
+   - `pyproject.toml` or `setup.py`.
+   - A top-level `backend/`, `src/`, or `app/` directory.
+2. Choose the directory that contains the main application code as the
+   repo root.
+
+## 2. Copy kit files
+
+- Copy (or move) the following into the repo root:
+  - `install.sh`
+  - `VERSION` (or merge into existing VERSION semantics)
+  - `v3_governance.yml`
+  - `governance.lock`
+  - `release.keep.yml`
+  - `scripts/` directory
+  - `docs/` directory
+
+If any of these already exist in the target repo:
+  - Read the existing file.
+  - Merge content instead of overwriting blindly.
+  - Preserve any project-specific behavior.
+
+## 3. Edit v3_governance.yml
+
+- Set `project_name` to the real project name.
+- Set `root_package` to the main Python package (e.g., `backend`, `app`).
+- Populate `critical_code_roots` with directories that contain real code.
+- Populate `canonical_files` with files that must always exist.
+- Adjust `stub_allowlist` and `hollow_paths_allowlist` to reflect where
+  stubs or hollow dirs are acceptable.
+- Add `critical_imports` that must succeed for the app to be healthy.
+
+## 4. Adjust install.sh
+
+- Confirm dependency installation logic matches the project:
+  - `requirements.txt` vs `pyproject.toml` vs other tools.
+- Decide whether Docker is required:
+  - If `docker-compose.yml` exists, keep `REQUIRE_DOCKER=1`.
+  - Otherwise, set `REQUIRE_DOCKER=0` or remove the Docker check.
+- Add project-specific steps (migrations/tests) at the bottom.
+
+## 5. Wire guards into CI (optional)
+
+- Add a CI workflow (e.g., GitHub Actions) that:
+  - Checks out the repo.
+  - Sets up Python.
+  - Installs dependencies.
+  - Runs `python scripts/guardian.py`.
+
+## 6. Use the rot audit prompt
+
+- When nervous about code rot or drift, run:
+  - `python scripts/rot_audit_prompt.py`
+- Paste the resulting prompt into an LLM and apply its recommendations.
+- Re-run `./install.sh` to validate.
+
+----- CONTENT END -----
+
+----- FILE PATH: docs/ROT_RUTHLESS_PROMPT.md
+----- CONTENT START -----
+# Rot Tribunal Prompt (Repository Rot Audit)
+
+You are the **Rot Tribunal** for a software repository.
+
+Your job is to detect and explain all forms of **rot** in this codebase:
+- Dead code (unused modules, unused functions, stale scripts).
+- Drift between documentation and code.
+- Deprecated or obsolete subsystems that linger but are no longer trusted.
+- Partially migrated architectures (old and new patterns co-existing).
+- "Barnacle" modules that nobody really owns or understands.
+- Ad-hoc debug tools that never became proper utilities.
+- Any area where the project no longer matches its stated governance rules.
+
+## Inputs you will be given
+
+- A **governance spec** (`v3_governance.yml`) including:
+  - project_name
+  - root_package
+  - critical_code_roots
+  - canonical_files
+  - stub_allowlist / hollow_paths_allowlist
+  - critical_imports
+- A **high-level description** of the repo structure:
+  - Key directories and their roles.
+  - Any known subsystems (API, worker, CLI, science pipeline, etc.).
+- (Optionally) file listings or samples from suspect directories.
+
+## Your tasks
+
+1. **Map the territory**
+   - Briefly summarize what the project *claims* it is (from governance).
+   - Summarize what the directory layout suggests it actually is.
+   - Highlight any obvious mismatch between the two.
+
+2. **Identify rot candidates**
+   For each of these categories, list concrete suspects:
+   - Dead or unused code:
+     - Modules that are never imported or referenced.
+     - Legacy scripts that belong to earlier versions of the architecture.
+   - Drifted documentation:
+     - Docs that describe APIs, modules, or behaviors that no longer exist.
+   - Partially migrated subsystems:
+     - Old and new implementations for the same feature co-existing.
+   - Ad-hoc debug tooling:
+     - One-off scripts that bypass governance or tests.
+
+3. **Classify severity**
+   For each suspect, rate:
+   - **Severity**: {Blocker, High, Medium, Low}
+   - **Scope**: {Local module, Subsystem, Cross-cutting}
+   - **Confidence**: {High, Medium, Low}
+   Explain why you chose that rating.
+
+4. **Recommend concrete actions**
+   For each item, prescribe one of:
+   - **Delete**: remove with a short migration note or doc update.
+   - **Refactor**: move into a maintained module, add tests, and put under governance.
+   - **Document as legacy**: keep, but clearly mark as legacy, with a short README.
+   - **Defer**: leave as-is but log as a known risk.
+
+5. **Produce a short Rot Kill List**
+   - A small, prioritized list (max 10 items) of the **most impactful** rot issues
+     to address in the next sprint.
+   - For each, give:
+     - Path(s)
+     - Issue summary
+     - Recommended action
+     - Expected benefit once fixed.
+
+## Output format
+
+- Section 1: High-level rot overview (1–2 paragraphs).
+- Section 2: Detailed rot findings per category.
+- Section 3: Rot Kill List (table or bullet list).
+- Section 4: Suggested next sprint focused on rot.
+
+----- CONTENT END -----
+
+----- FILE PATH: docs/RUTHLESS_MULTIPANEL_PROMPT.md
+----- CONTENT START -----
+# Ruthless Multi-Panel Prompt (Governance + Science + Rot)
+
+This prompt can be given to an LLM to run a multi-panel audit on a repository.
+Panels:
+
+1. Executive Verdict
+   - GO / NO-GO decision for the current build.
+   - Short explanation targeting a PI / tech lead.
+
+2. Lead Systems Developer
+   - Focus on architecture, layering, and technical debt.
+   - Identify any areas that will be hard to maintain or extend.
+
+3. Governance Officer
+   - Check alignment with `v3_governance.yml`:
+     - Are critical imports present?
+     - Are canonical files present?
+     - Are there any violations of stub/hollow policies?
+   - Assess whether the current governance rules are realistic.
+
+4. Rot Tribunal
+   - Use the Rot Tribunal guidelines (see `ROT_RUTHLESS_PROMPT.md`).
+   - Identify dead code, drift, partially migrated subsystems, and barnacles.
+
+5. Science / Domain Panel (optional)
+   - For projects with scientific logic, check:
+     - Are core models and metrics implemented (vs stubbed)?
+     - Are claims in the README / docs supported by code and tests?
+     - Are there obvious gaps between stated scientific goals and code?
+
+## Expected Output Structure
+
+- 1. Executive Verdict (GO / NO-GO + 3–5 bullet justification)
+- 2. Kill List (Blockers)
+- 3. Warnings (High/Medium)
+- 4. Panel Reports
+  - 4.1 Lead Systems Developer
+  - 4.2 Governance Officer
+  - 4.3 Rot Tribunal
+  - 4.4 Science Panel (if applicable)
+- 5. Recommended Next Sprint
+  - Concrete, bounded tasks that can be implemented in 1–2 iterations.
+
+----- CONTENT END -----
+

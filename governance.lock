@@ -1,0 +1,6 @@
+governance_version: 3
+locked_at: "2025-11-24"
+notes: >
+  Baseline governance lock for the Governance + Autoinstaller Kit template.
+  When adapting this kit to a real project, update this file after you have
+  consciously revised v3_governance.yml and validated the new invariants.

@@ -1,0 +1,8 @@
+keep:
+  - "VERSION"
+  - "v3_governance.yml"
+  - "governance.lock"
+  - "release.keep.yml"
+  - "install.sh"
+  - "scripts"
+  - "docs"

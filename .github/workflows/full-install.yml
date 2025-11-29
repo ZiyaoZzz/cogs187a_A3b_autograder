@@ -1,0 +1,37 @@
+name: Full Install Test
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:  # Allow manual trigger
+
+jobs:
+  install-test:
+    name: Test Full Installation
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      
+      - name: Run install.sh
+        run: |
+          chmod +x install.sh
+          PROJECT_NAME="cogs187-llm-autograder" ./install.sh
+      
+      - name: Upload install logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: install-logs
+          path: logs/
+          retention-days: 7
+

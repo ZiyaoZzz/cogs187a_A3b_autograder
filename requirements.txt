@@ -1,0 +1,22 @@
+# Core FastAPI backend dependencies
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+python-dotenv>=1.0.0
+
+# PDF processing
+pdfplumber>=0.10.0
+
+# AI/ML dependencies
+google-generativeai>=0.3.0
+
+# Image processing
+Pillow>=10.0.0
+
+# Web scraping and automation (for scripts)
+playwright>=1.40.0
+beautifulsoup4>=4.12.0
+requests>=2.31.0
+
+# Governance scripts dependencies
+pyyaml>=6.0.1
+

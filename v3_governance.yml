@@ -1,0 +1,41 @@
+# Governance spec for COGS 187A Assignment 3b Autograder
+# Protects core structure from AI modifications
+version: 3
+project_name: "cogs187-llm-autograder"
+root_package: "backend"
+
+# Critical directories that must exist and cannot be deleted
+critical_code_roots:
+  - "backend"          # FastAPI backend (core API)
+  - "scripts"          # Analysis and automation scripts
+  - "src"              # React frontend code
+  - "rubrics"          # Grading rubrics and criteria
+
+# Files that must always exist (canonical structure)
+canonical_files:
+  - "backend/main.py"           # FastAPI entrypoint
+  - "package.json"              # Frontend dependencies
+  - "v3_governance.yml"         # This governance config
+  - "governance.lock"           # Governance lock file
+  - "install.sh"                # Installation script
+  - "rubrics/a3_rubric.json"    # Grading rubric
+  - "vite.config.ts"            # Vite build config
+  - "tsconfig.json"             # TypeScript config
+  - "README.md"                 # Project documentation
+
+# Paths that can be empty or contain stub files (hollow)
+hollow_paths_allowlist:
+  - "submissions/**"            # Student submissions (may be empty)
+  - "output_static/**"          # Generated output (may be empty)
+  - "node_modules/**"           # npm dependencies (managed by npm)
+  - "output_static/student_analyses/**"  # Analysis results (generated)
+
+# Critical imports that must be importable
+critical_imports:
+  - "backend.main:app"         # FastAPI application entrypoint
+
+# Entrypoints for the application
+entrypoints:
+  api:
+    module: "backend.main"
+    object: "app"

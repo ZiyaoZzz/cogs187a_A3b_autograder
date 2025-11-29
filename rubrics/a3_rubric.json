@@ -1,0 +1,124 @@
+{
+  "heuristics": [
+    {
+      "number": 1,
+      "name": "Visibility of System Status",
+      "description": "Keep users informed about what's happening through timely feedback"
+    },
+    {
+      "number": 2,
+      "name": "Match Between System and the Real World",
+      "description": "Use familiar language, concepts, and conventions that users understand"
+    },
+    {
+      "number": 3,
+      "name": "User Control and Freedom",
+      "description": "Provide ways to undo/redo actions and exit unwanted states easily"
+    },
+    {
+      "number": 4,
+      "name": "Consistency and Standards",
+      "description": "Follow platform conventions and be consistent within your interface"
+    },
+    {
+      "number": 5,
+      "name": "Error Prevention",
+      "description": "Prevent problems before they occur through good design"
+    },
+    {
+      "number": 6,
+      "name": "Recognition Rather Than Recall",
+      "description": "Make objects, actions, and options visible; don't make users remember"
+    },
+    {
+      "number": 7,
+      "name": "Flexibility and Efficiency of Use",
+      "description": "Provide shortcuts and ways to customize for experienced users"
+    },
+    {
+      "number": 8,
+      "name": "Aesthetic and Minimalist Design",
+      "description": "Remove irrelevant or rarely needed information; keep it clean"
+    },
+    {
+      "number": 9,
+      "name": "Help Users Recognize, Diagnose, and Recover from Errors",
+      "description": "Error messages should be clear, indicate the problem, and suggest solutions"
+    },
+    {
+      "number": 10,
+      "name": "Help and Documentation",
+      "description": "Provide help documentation that is easy to find, searchable, and focused on user tasks"
+    }
+  ],
+  "rubric": {
+    "name": "COGS 187A - Assignment 3 Autograder Rubric",
+    "description": "Each submission is evaluated across core heuristic-evaluation criteria plus optional bonus sections.",
+    "totalPoints": 100,
+    "criteria": [
+      {
+        "key": "coverage",
+        "title": "Coverage",
+        "description": "All 10 heuristics addressed with a minimum of 12 distinct violations.",
+        "points": 15
+      },
+      {
+        "key": "violation_quality",
+        "title": "Violation Quality",
+        "description": "Clear explanations with realistic user scenarios and justified severity ratings.",
+        "points": 20
+      },
+      {
+        "key": "screenshots",
+        "title": "Screenshots & Evidence",
+        "description": "Well-annotated, high quality visual documentation for each violation.",
+        "points": 10
+      },
+      {
+        "key": "severity_analysis",
+        "title": "Severity Analysis",
+        "description": "Thoughtful severity ratings with a concise summary section.",
+        "points": 10
+      },
+      {
+        "key": "structure_navigation",
+        "title": "Structure & Navigation",
+        "description": "Submission organized into clear sections that are easy to follow.",
+        "points": 10
+      },
+      {
+        "key": "professional_quality",
+        "title": "Professional Quality",
+        "description": "Consistent formatting, polished presentation, and overall craft.",
+        "points": 10
+      },
+      {
+        "key": "writing_quality",
+        "title": "Writing Quality",
+        "description": "Clear, concise, and well-edited prose.",
+        "points": 10
+      },
+      {
+        "key": "group_integration",
+        "title": "Group Integration",
+        "description": "Evidence of collaborative evaluation and synthesis.",
+        "points": 15
+      }
+    ],
+    "bonusCriteria": [
+      {
+        "key": "bonus_ai_opportunities",
+        "title": "Bonus: Optional AI Opportunities Section",
+        "description": "Thoughtful discussion of how AI could improve UX, tied to violations and showing realistic understanding of AI capabilities/limitations.",
+        "points": 3
+      },
+      {
+        "key": "bonus_exceptional_quality",
+        "title": "Bonus: Exceptional Quality",
+        "description": "Work significantly exceeds expectations; portfolio-quality insight, creativity, or thoroughness.",
+        "points": 2
+      }
+    ]
+  }
+}
+
