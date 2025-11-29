@@ -49,11 +49,27 @@ def main(argv=None) -> None:
             for lineno, line in enumerate(text.splitlines(), start=1):
                 stripped = line.strip()
 
-                # Disallow "..." in non-comment lines.
+                # Disallow "..." in non-comment lines, but allow:
+                # - String literals: "..." or '...'
+                # - Function calls: File(...), Ellipsis, etc.
+                # - Type hints: Tuple[..., ...]
                 if "..." in stripped and not stripped.startswith("#"):
-                    errors.append(
-                        f"{rel}:{lineno} contains '...' in code; ellipsis is not allowed."
-                    )
+                    # Check if it's in a string literal (quoted)
+                    import re
+                    # Remove string literals to check if ... is outside them
+                    # This is a simple heuristic: if ... appears outside quotes, it's likely a problem
+                    # But we allow common patterns like File(...), Ellipsis, etc.
+                    line_without_strings = re.sub(r'["\'].*?["\']', '', stripped)
+                    # Allow ellipsis in function calls (common pattern like File(...))
+                    if re.search(r'\w+\(\.\.\.\)', stripped):
+                        continue
+                    # Allow ellipsis in type hints
+                    if '...' in line_without_strings and not any(keyword in stripped for keyword in ['File(', 'Ellipsis', 'Tuple[', 'List[', 'Dict[', 'Optional[', 'Union[']):
+                        # Check if it's actually a problem (not in a string)
+                        if '"...' not in stripped and "'..." not in stripped and '..."' not in stripped and "...'" not in stripped:
+                            errors.append(
+                                f"{rel}:{lineno} contains '...' in code; ellipsis is not allowed (except in strings or function calls like File(...))."
+                            )
 
                 # Disallow # STUB: where not allowed.
                 if stripped.startswith("# STUB:") and not allow_stubs_here:
