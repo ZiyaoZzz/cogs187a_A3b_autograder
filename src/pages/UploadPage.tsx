@@ -63,6 +63,32 @@ export default function UploadPage() {
   }>>([]);
   const [comparisonLoading, setComparisonLoading] = useState<boolean>(false);
   const [heuristicsInfo, setHeuristicsInfo] = useState<HeuristicInfo[]>([]);
+  const [previousSubmissions, setPreviousSubmissions] = useState<Array<{
+    jobId: string;
+    fileName?: string;
+    createdAt?: string;
+    hasAnalysis?: boolean;
+  }>>([]);
+  const [loadingPrevious, setLoadingPrevious] = useState(false);
+  const [duplicateFile, setDuplicateFile] = useState<{
+    jobId: string;
+    fileName: string;
+    hasAnalysis: boolean;
+  } | null>(null);
+  
+  // Batch mode state
+  const [batchMode, setBatchMode] = useState(false);
+  const [batchFiles, setBatchFiles] = useState<File[]>([]);
+  const [batchQueue, setBatchQueue] = useState<Array<{
+    file: File;
+    status: "pending" | "extracting" | "analyzing" | "completed" | "error";
+    jobId?: string;
+    error?: string;
+    progress?: number;
+  }>>([]);
+  const [batchProcessing, setBatchProcessing] = useState(false);
+  const [batchPaused, setBatchPaused] = useState(false);
+  const [batchSize, setBatchSize] = useState(1); // Process 1 at a time by default
 
   // Load heuristics info from rubric
   useEffect(() => {
@@ -80,6 +106,53 @@ export default function UploadPage() {
       }
     }
     loadHeuristicsInfo();
+  }, []);
+
+  // Load previous submissions on mount
+  useEffect(() => {
+    async function loadPreviousSubmissions() {
+      setLoadingPrevious(true);
+      try {
+        const res = await fetch("http://localhost:8000/api/list-jobs");
+        if (res.ok) {
+          const data = await res.json();
+          const jobs = data.jobs || [];
+          
+          // Check which jobs have analysis results
+          const jobsWithAnalysis = await Promise.all(
+            jobs.map(async (job: any) => {
+              try {
+                const analysisRes = await fetch(`http://localhost:8000/api/get-analysis-results?jobId=${job.jobId}`);
+                const hasAnalysis = analysisRes.ok && (await analysisRes.json()).results?.length > 0;
+                return {
+                  ...job,
+                  hasAnalysis,
+                };
+              } catch {
+                return { ...job, hasAnalysis: false };
+              }
+            })
+          );
+          
+          // Sort: ungraded (no analysis) first, then by date (newest first)
+          jobsWithAnalysis.sort((a, b) => {
+            if (a.hasAnalysis !== b.hasAnalysis) {
+              return a.hasAnalysis ? 1 : -1; // ungraded first
+            }
+            const dateA = a.createdAt ? new Date(a.createdAt).getTime() : 0;
+            const dateB = b.createdAt ? new Date(b.createdAt).getTime() : 0;
+            return dateB - dateA; // newest first
+          });
+          
+          setPreviousSubmissions(jobsWithAnalysis);
+        }
+      } catch (err) {
+        console.error("Failed to load previous submissions:", err);
+      } finally {
+        setLoadingPrevious(false);
+      }
+    }
+    loadPreviousSubmissions();
   }, []);
 
   // Load Julian pages index on mount
@@ -332,16 +405,103 @@ export default function UploadPage() {
     setComparisonResults(results);
   }, [compareAllJulianPages, allJulianAnalyses, analysisResults, julianPages]);
 
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const f = e.target.files?.[0] ?? null;
-    setFile(f);
+  const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (batchMode) {
+      const files = Array.from(e.target.files || []);
+      const pdfFiles = files.filter(f => f.name.toLowerCase().endsWith(".pdf"));
+      setBatchFiles(pdfFiles);
+      
+      // Refresh previous submissions to check for duplicates
+      await refreshPreviousSubmissions();
+      
+      // Initialize queue
+      setBatchQueue(pdfFiles.map(file => ({
+        file,
+        status: "pending" as const,
+      })));
+    } else {
+      const f = e.target.files?.[0] ?? null;
+      setFile(f);
+      setError(null);
+      setResult(null); // Clear previous result when selecting a new file
+    }
+  };
+
+  // Load a previous submission
+  const loadPreviousSubmission = async (jobId: string) => {
+    setLoading(true);
     setError(null);
-    setResult(null); // Clear previous result when selecting a new file
+    try {
+      // Load extraction result
+      const pagesRes = await fetch(`http://localhost:8000/api/get-extraction-result?jobId=${jobId}`);
+      if (!pagesRes.ok) throw new Error("Failed to load submission");
+
+      const pagesData = await pagesRes.json();
+      
+      // Load analysis results if they exist
+      const analysisRes = await fetch(`http://localhost:8000/api/get-analysis-results?jobId=${jobId}`);
+      let analysisResults: PageAnalysisResult[] = [];
+      
+      if (analysisRes.ok) {
+        const analysisData = await analysisRes.json();
+        analysisResults = analysisData.results || [];
+      }
+
+      // Create extraction result
+      const normalizedPages = (pagesData.pages || []).map(
+        (page: { page_number: number; snippet: string; image_base64?: string }) => ({
+          pageNumber: page.page_number,
+          snippet: page.snippet,
+          imageBase64: page.image_base64,
+        }),
+      );
+
+      const extractionResult: HeuristicExtractionResult = {
+        jobId: pagesData.jobId || jobId,
+        fileName: pagesData.fileName,
+        createdAt: pagesData.createdAt || new Date().toISOString(),
+        pageCount: pagesData.pageCount || normalizedPages.length,
+        pages: normalizedPages,
+      };
+
+      setResult(extractionResult);
+      if (analysisResults.length > 0) {
+        setAnalysisResults(analysisResults);
+      }
+    } catch (err: any) {
+      setError(err.message || "Failed to load previous submission");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Delete a submission
+  const deleteSubmission = async (jobId: string) => {
+    try {
+      const res = await fetch(`http://localhost:8000/api/delete-submission?jobId=${jobId}`, {
+        method: "DELETE",
+      });
+
+      if (!res.ok) {
+        throw new Error("Failed to delete submission");
+      }
+
+      // Remove from previous submissions list
+      setPreviousSubmissions(prev => prev.filter(s => s.jobId !== jobId));
+      
+      // If it was the duplicate file, clear it
+      if (duplicateFile?.jobId === jobId) {
+        setDuplicateFile(null);
+      }
+    } catch (err: any) {
+      setError(err.message || "Failed to delete submission");
+    }
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
+    setDuplicateFile(null);
 
     if (!file) {
       setError("Please upload a PDF file.");
@@ -352,10 +512,244 @@ export default function UploadPage() {
       return;
     }
 
-    setLoading(true);
+    // Check for duplicate filename
+    const existingSubmission = previousSubmissions.find(
+      s => s.fileName?.toLowerCase() === file.name.toLowerCase()
+    );
+
+    if (existingSubmission) {
+      setDuplicateFile({
+        jobId: existingSubmission.jobId,
+        fileName: file.name,
+        hasAnalysis: existingSubmission.hasAnalysis || false,
+      });
+      return; // Stop here, show duplicate warning
+    }
+
+    // Use the helper function to perform upload
+    await performUpload(file);
+    
+    // Refresh previous submissions list
+    await refreshPreviousSubmissions();
+  };
+
+  // Batch processing functions
+  const processBatchItem = async (item: typeof batchQueue[0], index: number) => {
+    const file = item.file;
+    
+    // Update status to extracting
+    setBatchQueue(prev => prev.map((q, i) => 
+      i === index ? { ...q, status: "extracting", progress: 0 } : q
+    ));
+
     try {
+      // Step 1: Extract pages
       const formData = new FormData();
       formData.append("file", file);
+      
+      const extractRes = await fetch("http://localhost:8000/api/extract-heuristic-pages", {
+        method: "POST",
+        body: formData,
+      });
+
+      if (!extractRes.ok) {
+        throw new Error(`Extraction failed: ${extractRes.statusText}`);
+      }
+
+      const extractData = await extractRes.json();
+      const jobId = extractData.job_id || `job-${Date.now()}-${index}`;
+      
+      // Update status to analyzing
+      setBatchQueue(prev => prev.map((q, i) => 
+        i === index ? { ...q, status: "analyzing", jobId, progress: 50 } : q
+      ));
+
+      // Step 2: Analyze pages
+      const pages = extractData.pages || [];
+      const analysisResults: PageAnalysisResult[] = [];
+      
+      for (let i = 0; i < pages.length; i++) {
+        const page = pages[i];
+        const normalizedPage = {
+          pageNumber: page.page_number,
+          snippet: page.snippet,
+          imageBase64: page.image_base64,
+        };
+
+        try {
+          const analysisRes = await fetch("http://localhost:8000/api/analyze-single-page", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              page: normalizedPage,
+              jobId,
+            }),
+          });
+
+          if (analysisRes.ok) {
+            const analysisData = await analysisRes.json();
+            if (analysisData.status === "completed" && analysisData.result) {
+              analysisResults.push(analysisData.result);
+            }
+          }
+
+          // Update progress
+          const progress = 50 + Math.floor((i + 1) / pages.length * 50);
+          setBatchQueue(prev => prev.map((q, idx) => 
+            idx === index ? { ...q, progress } : q
+          ));
+        } catch (err) {
+          console.error(`Error analyzing page ${i + 1} of ${file.name}:`, err);
+        }
+      }
+
+      // Mark as completed
+      setBatchQueue(prev => prev.map((q, i) => 
+        i === index ? { ...q, status: "completed", progress: 100 } : q
+      ));
+
+      // Refresh submissions list
+      await refreshPreviousSubmissions();
+    } catch (err: any) {
+      setBatchQueue(prev => prev.map((q, i) => 
+        i === index ? { 
+          ...q, 
+          status: "error", 
+          error: err.message || "Processing failed" 
+        } : q
+      ));
+    }
+  };
+
+  const processBatch = async () => {
+    if (batchQueue.length === 0 || batchProcessing) return;
+
+    setBatchProcessing(true);
+    setBatchPaused(false);
+
+    // Process items in batches
+    let processedCount = 0;
+    
+    while (processedCount < batchQueue.length) {
+      // Check if paused
+      if (batchPaused) {
+        setBatchProcessing(false);
+        return;
+      }
+
+      // Get next batch of pending items
+      const pendingItems = batchQueue
+        .map((item, index) => ({ item, index }))
+        .filter(({ item }) => item.status === "pending");
+
+      if (pendingItems.length === 0) {
+        // All items processed
+        break;
+      }
+
+      const batch = pendingItems.slice(0, batchSize);
+      
+      // Process batch (sequentially or in parallel based on batchSize)
+      if (batchSize === 1) {
+        // Process one at a time
+        for (const { item, index } of batch) {
+          await processBatchItem(item, index);
+          processedCount++;
+        }
+      } else {
+        // Process batch in parallel
+        await Promise.all(batch.map(({ item, index }) => processBatchItem(item, index)));
+        processedCount += batch.length;
+      }
+
+      // Small delay between batches to avoid overwhelming the API
+      if (pendingItems.length > batch.length) {
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      }
+    }
+
+    setBatchProcessing(false);
+  };
+
+  const pauseBatch = () => {
+    setBatchPaused(true);
+  };
+
+  const resumeBatch = () => {
+    setBatchPaused(false);
+    processBatch();
+  };
+
+  const clearBatch = () => {
+    setBatchFiles([]);
+    setBatchQueue([]);
+    setBatchProcessing(false);
+    setBatchPaused(false);
+  };
+
+  // Helper function to refresh previous submissions list
+  const refreshPreviousSubmissions = async () => {
+    try {
+      const jobsRes = await fetch("http://localhost:8000/api/list-jobs");
+      if (jobsRes.ok) {
+        const jobsData = await jobsRes.json();
+        const jobs = jobsData.jobs || [];
+        const jobsWithAnalysis = await Promise.all(
+          jobs.map(async (job: any) => {
+            try {
+              const analysisRes = await fetch(`http://localhost:8000/api/get-analysis-results?jobId=${job.jobId}`);
+              const hasAnalysis = analysisRes.ok && (await analysisRes.json()).results?.length > 0;
+              return { ...job, hasAnalysis };
+            } catch {
+              return { ...job, hasAnalysis: false };
+            }
+          })
+        );
+        jobsWithAnalysis.sort((a, b) => {
+          if (a.hasAnalysis !== b.hasAnalysis) {
+            return a.hasAnalysis ? 1 : -1;
+          }
+          const dateA = a.createdAt ? new Date(a.createdAt).getTime() : 0;
+          const dateB = b.createdAt ? new Date(b.createdAt).getTime() : 0;
+          return dateB - dateA;
+        });
+        setPreviousSubmissions(jobsWithAnalysis);
+      }
+    } catch (err) {
+      console.error("Failed to refresh submissions list:", err);
+    }
+  };
+
+  // Handle duplicate file - user can choose to load existing or continue upload
+  const handleDuplicateChoice = async (choice: "load" | "upload" | "delete") => {
+    if (!duplicateFile || !file) return;
+
+    if (choice === "load") {
+      await loadPreviousSubmission(duplicateFile.jobId);
+      setDuplicateFile(null);
+    } else if (choice === "delete") {
+      if (window.confirm(`Are you sure you want to delete "${duplicateFile.fileName}"? This action cannot be undone.`)) {
+        await deleteSubmission(duplicateFile.jobId);
+        setDuplicateFile(null);
+        // After deletion, proceed with upload
+        await performUpload(file);
+        await refreshPreviousSubmissions();
+      }
+    } else if (choice === "upload") {
+      // Continue with upload anyway (will create a new submission with same filename)
+      setDuplicateFile(null);
+      await performUpload(file);
+      await refreshPreviousSubmissions();
+    }
+  };
+
+  // Helper function to perform upload
+  const performUpload = async (fileToUpload: File) => {
+    setLoading(true);
+    setError(null);
+    try {
+      const formData = new FormData();
+      formData.append("file", fileToUpload);
 
       const res = await fetch("http://localhost:8000/api/extract-heuristic-pages", {
         method: "POST",
@@ -377,10 +771,10 @@ export default function UploadPage() {
         }),
       );
 
-      const jobId = `job-${Date.now()}`;
+      const jobId = data.job_id || `job-${Date.now()}`;
       const extractionResult: HeuristicExtractionResult = {
         jobId,
-        fileName: file.name,
+        fileName: fileToUpload.name,
         createdAt: new Date().toISOString(),
         pageCount: data.page_count ?? normalizedPages.length,
         pages: normalizedPages,
@@ -388,7 +782,13 @@ export default function UploadPage() {
 
       setResult(extractionResult);
     } catch (err: any) {
-      setError(err.message || "Something went wrong while parsing the PDF.");
+      let errorMessage = err.message || "Something went wrong while parsing the PDF.";
+      
+      if (err.message?.includes("Failed to fetch") || err.message?.includes("NetworkError") || err.name === "TypeError") {
+        errorMessage = "Cannot connect to backend server. Please ensure the backend is running:\n\n1. Run: npm start\n2. Or manually: cd backend && python -m uvicorn main:app --reload\n3. Backend should be available at http://localhost:8000";
+      }
+      
+      setError(errorMessage);
     } finally {
       setLoading(false);
     }
@@ -443,11 +843,17 @@ export default function UploadPage() {
             }
             throw new Error("Unknown response status");
           } catch (err: any) {
+            // Check if it's a connection error
+            let errorMsg = err.message || "Failed to analyze this page";
+            if (err.message?.includes("Failed to fetch") || err.message?.includes("NetworkError") || err.name === "TypeError") {
+              errorMsg = "Cannot connect to backend server. Please ensure the backend is running.";
+            }
+            
             // Return error result
             return {
               page_number: page.pageNumber,
-              error: err.message || "Failed to analyze this page",
-              feedback: `Error analyzing page ${page.pageNumber}: ${err.message || "Unknown error"}`,
+              error: errorMsg,
+              feedback: `Error analyzing page ${page.pageNumber}: ${errorMsg}`,
             };
           }
         });
@@ -461,7 +867,14 @@ export default function UploadPage() {
         setAnalysisResults([...results]);
       }
     } catch (err: any) {
-      setError(err.message || "Something went wrong while analyzing with Gemini.");
+      let errorMessage = err.message || "Something went wrong while analyzing with Gemini.";
+      
+      // Check if it's a connection error
+      if (err.message?.includes("Failed to fetch") || err.message?.includes("NetworkError") || err.name === "TypeError") {
+        errorMessage = "Cannot connect to backend server. Please ensure the backend is running:\n\n1. Run: npm start\n2. Or manually: cd backend && python -m uvicorn main:app --reload\n3. Backend should be available at http://localhost:8000";
+      }
+      
+      setError(errorMessage);
     } finally {
       setAnalyzing(false);
       setAnalyzingProgress(null);
@@ -720,14 +1133,317 @@ export default function UploadPage() {
           Upload your heuristic evaluation PDF
         </h1>
 
+        {/* Duplicate File Warning */}
+        {duplicateFile && (
+          <div className="border border-amber-300 rounded-lg p-4 bg-amber-50">
+            <div className="flex items-start gap-3">
+              <div className="flex-shrink-0">
+                <svg className="w-5 h-5 text-amber-600" fill="currentColor" viewBox="0 0 20 20">
+                  <path fillRule="evenodd" d="M8.257 3.099c.765-1.36 2.722-1.36 3.486 0l5.58 9.92c.75 1.334-.213 2.98-1.742 2.98H4.42c-1.53 0-2.493-1.646-1.743-2.98l5.58-9.92zM11 13a1 1 0 11-2 0 1 1 0 012 0zm-1-8a1 1 0 00-1 1v3a1 1 0 002 0V6a1 1 0 00-1-1z" clipRule="evenodd" />
+                </svg>
+              </div>
+              <div className="flex-1">
+                <h3 className="text-sm font-semibold text-amber-900 mb-1">
+                  File Already Exists
+                </h3>
+                <p className="text-sm text-amber-800 mb-3">
+                  A submission with the filename <span className="font-medium">"{duplicateFile.fileName}"</span> already exists.
+                  {duplicateFile.hasAnalysis ? " It has been graded." : " It has not been graded yet."}
+                </p>
+                <div className="flex gap-2">
+                  <button
+                    type="button"
+                    onClick={() => handleDuplicateChoice("load")}
+                    className="px-3 py-1.5 text-sm bg-sky-600 text-white rounded-md hover:bg-sky-700"
+                  >
+                    Load Existing
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleDuplicateChoice("upload")}
+                    className="px-3 py-1.5 text-sm bg-slate-600 text-white rounded-md hover:bg-slate-700"
+                  >
+                    Upload Anyway
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleDuplicateChoice("delete")}
+                    className="px-3 py-1.5 text-sm bg-red-600 text-white rounded-md hover:bg-red-700"
+                  >
+                    Delete & Upload New
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setDuplicateFile(null)}
+                    className="px-3 py-1.5 text-sm bg-slate-200 text-slate-700 rounded-md hover:bg-slate-300"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Previous Submissions Section */}
+        {previousSubmissions.length > 0 && (
+          <div className="border border-slate-200 rounded-lg p-4 bg-slate-50">
+            <h2 className="text-sm font-semibold text-slate-700 mb-3">
+              Previous Submissions
+            </h2>
+            <div className="space-y-2 max-h-48 overflow-y-auto">
+              {previousSubmissions.map((submission) => (
+                <div
+                  key={submission.jobId}
+                  className="flex items-center justify-between p-2 bg-white rounded border border-slate-200 hover:border-slate-300"
+                >
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2">
+                      <span className="text-sm font-medium text-slate-900 truncate">
+                        {submission.fileName || submission.jobId}
+                      </span>
+                      {submission.hasAnalysis ? (
+                        <span className="text-xs bg-green-100 text-green-800 px-2 py-0.5 rounded">
+                          Graded
+                        </span>
+                      ) : (
+                        <span className="text-xs bg-amber-100 text-amber-800 px-2 py-0.5 rounded">
+                          Not Graded
+                        </span>
+                      )}
+                    </div>
+                    {submission.createdAt && (
+                      <p className="text-xs text-slate-500 mt-0.5">
+                        {new Date(submission.createdAt).toLocaleString()}
+                      </p>
+                    )}
+                  </div>
+                  <div className="flex items-center gap-2 ml-3">
+                    <button
+                      type="button"
+                      onClick={() => loadPreviousSubmission(submission.jobId)}
+                      disabled={loading}
+                      className="px-3 py-1.5 text-sm bg-sky-600 text-white rounded-md hover:bg-sky-700 disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      {loading ? "Loading..." : "Load"}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        if (window.confirm(`Are you sure you want to delete "${submission.fileName || submission.jobId}"? This action cannot be undone.`)) {
+                          deleteSubmission(submission.jobId);
+                        }
+                      }}
+                      className="px-2 py-1.5 text-sm bg-red-600 text-white rounded-md hover:bg-red-700"
+                      title="Delete submission"
+                    >
+                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                      </svg>
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Batch Mode Toggle */}
+        <div className="flex items-center gap-4 mb-4">
+          <label className="flex items-center gap-2 text-sm text-slate-700">
+            <input
+              type="checkbox"
+              checked={batchMode}
+              onChange={(e) => {
+                setBatchMode(e.target.checked);
+                if (!e.target.checked) {
+                  clearBatch();
+                }
+              }}
+              className="rounded border-slate-300"
+            />
+            <span className="font-medium">Batch Mode</span>
+          </label>
+          {batchMode && (
+            <div className="flex items-center gap-2 text-sm text-slate-600">
+              <label>Batch Size:</label>
+              <select
+                value={batchSize}
+                onChange={(e) => setBatchSize(parseInt(e.target.value, 10))}
+                disabled={batchProcessing}
+                className="px-2 py-1 border border-slate-300 rounded text-sm"
+              >
+                <option value={1}>1 at a time</option>
+                <option value={2}>2 at a time</option>
+                <option value={5}>5 at a time</option>
+                <option value={10}>10 at a time</option>
+              </select>
+            </div>
+          )}
+        </div>
+
+        {/* Batch Queue Display */}
+        {batchMode && batchQueue.length > 0 && (
+          <div className="border border-slate-200 rounded-lg p-4 bg-slate-50 mb-4">
+            <div className="flex items-center justify-between mb-3">
+              <h2 className="text-sm font-semibold text-slate-700">
+                Batch Queue ({batchQueue.filter(q => q.status === "completed").length}/{batchQueue.length} completed)
+              </h2>
+              <div className="flex gap-2">
+                {!batchProcessing && !batchPaused && (
+                  <button
+                    type="button"
+                    onClick={processBatch}
+                    className="px-3 py-1.5 text-sm bg-green-600 text-white rounded-md hover:bg-green-700"
+                  >
+                    Start Processing
+                  </button>
+                )}
+                {batchProcessing && !batchPaused && (
+                  <button
+                    type="button"
+                    onClick={pauseBatch}
+                    className="px-3 py-1.5 text-sm bg-amber-600 text-white rounded-md hover:bg-amber-700"
+                  >
+                    Pause
+                  </button>
+                )}
+                {batchPaused && (
+                  <button
+                    type="button"
+                    onClick={resumeBatch}
+                    className="px-3 py-1.5 text-sm bg-sky-600 text-white rounded-md hover:bg-sky-700"
+                  >
+                    Resume
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={clearBatch}
+                  disabled={batchProcessing}
+                  className="px-3 py-1.5 text-sm bg-red-600 text-white rounded-md hover:bg-red-700 disabled:opacity-50"
+                >
+                  Clear
+                </button>
+              </div>
+            </div>
+            <div className="space-y-2 max-h-64 overflow-y-auto">
+              {batchQueue.map((item, index) => {
+                // Check if this file matches a previous submission
+                // Only show as duplicate if the item is NOT completed (completed items are expected to be in previous submissions)
+                const duplicateSubmission = item.status !== "completed" 
+                  ? previousSubmissions.find((sub) => sub.fileName === item.file.name)
+                  : null;
+                
+                return (
+                  <div
+                    key={index}
+                    className="p-2 bg-white rounded border border-slate-200"
+                  >
+                    <div className="flex items-center justify-between">
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-2">
+                          <span className="text-sm font-medium text-slate-900 truncate">
+                            {item.file.name}
+                          </span>
+                          {duplicateSubmission && (
+                            <span className="text-xs bg-amber-100 text-amber-800 px-2 py-0.5 rounded">
+                              Duplicate
+                            </span>
+                          )}
+                          {item.status === "pending" && (
+                            <span className="text-xs bg-slate-100 text-slate-700 px-2 py-0.5 rounded">
+                              Pending
+                            </span>
+                          )}
+                          {item.status === "extracting" && (
+                            <span className="text-xs bg-blue-100 text-blue-800 px-2 py-0.5 rounded">
+                              Extracting...
+                            </span>
+                          )}
+                          {item.status === "analyzing" && (
+                            <span className="text-xs bg-amber-100 text-amber-800 px-2 py-0.5 rounded">
+                              Analyzing... {item.progress}%
+                            </span>
+                          )}
+                          {item.status === "completed" && (
+                            <span className="text-xs bg-green-100 text-green-800 px-2 py-0.5 rounded">
+                              Completed
+                            </span>
+                          )}
+                          {item.status === "error" && (
+                            <span className="text-xs bg-red-100 text-red-800 px-2 py-0.5 rounded">
+                              Error
+                            </span>
+                          )}
+                        </div>
+                        {duplicateSubmission && (
+                          <p className="text-xs text-amber-600 mt-1">
+                            Already exists: {duplicateSubmission.hasAnalysis ? "Graded" : "Not Graded"}
+                          </p>
+                        )}
+                        {item.progress !== undefined && item.status !== "completed" && (
+                          <div className="mt-1 w-full bg-slate-200 rounded-full h-1.5">
+                            <div
+                              className="bg-sky-600 h-1.5 rounded-full transition-all"
+                              style={{ width: `${item.progress}%` }}
+                            />
+                          </div>
+                        )}
+                        {item.error && (
+                          <p className="text-xs text-red-600 mt-1">{item.error}</p>
+                        )}
+                      </div>
+                      <div className="flex items-center gap-2 ml-3">
+                        {duplicateSubmission && item.status === "pending" && (
+                          <button
+                            type="button"
+                            onClick={async () => {
+                              if (window.confirm(`Are you sure you want to delete the existing submission "${duplicateSubmission.fileName}"? This action cannot be undone.`)) {
+                                await deleteSubmission(duplicateSubmission.jobId);
+                                await refreshPreviousSubmissions();
+                              }
+                            }}
+                            className="px-2 py-1 text-xs bg-red-600 text-white rounded-md hover:bg-red-700"
+                            title="Delete existing submission"
+                          >
+                            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                            </svg>
+                          </button>
+                        )}
+                        {item.status === "pending" && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setBatchQueue(prev => prev.filter((_, i) => i !== index));
+                            }}
+                            className="px-2 py-1 text-xs bg-slate-600 text-white rounded-md hover:bg-slate-700"
+                            title="Remove from queue"
+                          >
+                            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                            </svg>
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
         <form onSubmit={handleSubmit} className="space-y-4">
           <div>
             <label className="block text-sm font-medium text-slate-700 mb-1">
-              Submission file (PDF)
+              {batchMode ? "Submission files (PDF) - Select multiple" : "Submission file (PDF)"}
             </label>
             <input
               type="file"
               accept="application/pdf"
+              multiple={batchMode}
               onChange={handleFileChange}
               className="block w-full text-sm text-slate-700
                          file:mr-4 file:py-2 file:px-4
@@ -737,20 +1453,43 @@ export default function UploadPage() {
                          hover:file:bg-slate-200"
             />
             <p className="mt-1 text-xs text-slate-500">
-              We will automatically extract the pages where you discuss Nielsen’s heuristics
-              (not pages that only describe the interface).
+              {batchMode 
+                ? "Select multiple PDF files. They will be processed in batches."
+                : "We will automatically extract the pages where you discuss Nielsen's heuristics (not pages that only describe the interface)."}
             </p>
+            {batchMode && batchFiles.length > 0 && (
+              <p className="mt-1 text-xs text-slate-600">
+                {batchFiles.length} file(s) selected
+              </p>
+            )}
           </div>
 
-          <button
-            type="submit"
-            disabled={!file || loading}
-            className="inline-flex items-center justify-center rounded-md
-                       bg-sky-600 px-4 py-2 text-sm font-medium text-white
-                       hover:bg-sky-700 disabled:opacity-50 disabled:cursor-not-allowed"
-          >
-            {loading ? "Analyzing…" : "Upload & Extract Heuristic Pages"}
-          </button>
+          {!batchMode && (
+            <button
+              type="submit"
+              disabled={!file || loading}
+              className="inline-flex items-center justify-center rounded-md
+                         bg-sky-600 px-4 py-2 text-sm font-medium text-white
+                         hover:bg-sky-700 disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              {loading ? "Analyzing…" : "Upload & Extract Heuristic Pages"}
+            </button>
+          )}
+          
+          {batchMode && batchFiles.length > 0 && (
+            <div className="flex gap-2">
+              <button
+                type="button"
+                onClick={processBatch}
+                disabled={batchProcessing || batchQueue.length === 0}
+                className="inline-flex items-center justify-center rounded-md
+                           bg-sky-600 px-4 py-2 text-sm font-medium text-white
+                           hover:bg-sky-700 disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {batchProcessing ? "Processing..." : "Start Batch Processing"}
+              </button>
+            </div>
+          )}
 
           {error && (
             <p className="text-sm text-red-600 mt-2">

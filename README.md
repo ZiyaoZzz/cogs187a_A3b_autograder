@@ -34,13 +34,48 @@ your-project/
 └── README.md
 ```
 
-## Setup
+## Quick Start
 
-### Frontend (React + Vite)
+### One-Command Start (Recommended)
+
+Start both frontend and backend servers:
+
+```bash
+# Method 1: Using npm (Recommended)
+npm start
+
+# Method 2: Using shell script
+./start.sh
+
+# Method 3: Using Python script
+python3 start.py
+```
+
+All methods will:
+- Automatically check and install dependencies (if needed)
+- Start both frontend (http://localhost:5173) and backend (http://localhost:8000) simultaneously
+- Use Ctrl+C to stop both servers
+
+### Manual Setup
+
+If you need to start manually:
+
+#### Frontend (React + Vite)
 
 ```bash
 npm install
 npm run dev
+```
+
+#### Backend (FastAPI)
+
+```bash
+# Install dependencies
+pip install -r requirements.txt
+
+# Start server
+cd backend
+python -m uvicorn main:app --reload
 ```
 
 ### Python Scripts

@@ -1,27 +1,28 @@
-
 {
     "name": "cogs187-llm-autograder",
     "version": "0.0.1",
     "private": true,
     "scripts": {
-      "dev": "vite",
-      "build": "vite build",
-      "preview": "vite preview"
+        "dev": "vite",
+        "build": "vite build",
+        "preview": "vite preview",
+        "start": "./start.sh",
+        "backend": "cd backend && (if [ -f ../.venv/bin/python ]; then ../.venv/bin/python -m uvicorn main:app --reload --host 0.0.0.0 --port 8000; elif [ -f ../.venv/Scripts/python.exe ]; then ../.venv/Scripts/python.exe -m uvicorn main:app --reload --host 0.0.0.0 --port 8000; else python3 -m uvicorn main:app --reload --host 0.0.0.0 --port 8000; fi)"
     },
     "dependencies": {
-      "react": "^18.3.1",
-      "react-dom": "^18.3.1",
-      "react-router-dom": "^7.0.1"
+        "react": "^18.3.1",
+        "react-dom": "^18.3.1",
+        "react-router-dom": "^7.0.1"
     },
     "devDependencies": {
-      "@types/react": "^18.3.3",
-      "@types/react-dom": "^18.3.0",
-      "@vitejs/plugin-react-swc": "^3.7.0",
-      "autoprefixer": "^10.4.20",
-      "postcss": "^8.4.47",
-      "tailwindcss": "^3.4.15",
-      "typescript": "^5.6.3",
-      "vite": "^6.0.1"
+        "@types/react": "^18.3.3",
+        "@types/react-dom": "^18.3.0",
+        "@vitejs/plugin-react-swc": "^3.7.0",
+        "autoprefixer": "^10.4.20",
+        "concurrently": "^9.2.1",
+        "postcss": "^8.4.47",
+        "tailwindcss": "^3.4.15",
+        "typescript": "^5.6.3",
+        "vite": "^6.0.1"
     }
-  }
-  
+}

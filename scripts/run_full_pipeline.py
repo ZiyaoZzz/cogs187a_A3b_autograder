@@ -6,7 +6,7 @@ from pathlib import Path
 
 
 def main() -> None:
-    # 项目根目录：.../cogs187a_A3b_autograder/
+    # Project root directory: .../cogs187a_A3b_autograder/
     base_dir = Path(__file__).resolve().parent.parent
 
     output_dir = base_dir / "output_static"
@@ -18,7 +18,7 @@ def main() -> None:
 
     print("=== [1] Cleaning previous analysis and overlays ===")
 
-    # 删除新的 desktop / mobile 目录
+    # Remove new desktop / mobile directories
     if desktop_dir.exists():
         print(f"  - Removing desktop dir: {desktop_dir}")
         shutil.rmtree(desktop_dir)
@@ -26,7 +26,7 @@ def main() -> None:
         print(f"  - Removing mobile dir: {mobile_dir}")
         shutil.rmtree(mobile_dir)
 
-    # 清理遗留的旧目录
+    # Clean up legacy directories
     if legacy_analysis_dir.exists():
         print(f"  - Removing legacy analysis dir: {legacy_analysis_dir}")
         shutil.rmtree(legacy_analysis_dir)
@@ -34,7 +34,7 @@ def main() -> None:
         print(f"  - Removing legacy overlays dir: {legacy_overlays_dir}")
         shutil.rmtree(legacy_overlays_dir)
 
-    # 可选：删掉旧的 pages_index.json，让 crawl_to_pdfs 重新写
+    # Optional: Remove old pages_index.json to let crawl_to_pdfs rewrite it
     if pages_index.exists():
         print(f"  - Removing old pages_index: {pages_index}")
         pages_index.unlink()

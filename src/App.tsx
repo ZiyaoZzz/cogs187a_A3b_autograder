@@ -2,8 +2,8 @@
 import { Link, Route, Routes } from "react-router-dom";
 import { HomePage } from "./pages/HomePage";
 import UploadPage from "./pages/UploadPage";
-import { JulianPagesPage } from "./pages/JulianPagesPage";
-import LLMRecommendationsPage from "./pages/LLMRecommendationsPage";
+import ReviewerModePage from "./pages/ReviewerModePage";
+import PromptRefinementPage from "./pages/PromptRefinementPage";
 
 export default function App() {
   return (
@@ -18,16 +18,16 @@ export default function App() {
               Grade PDF
             </Link>
             <Link
-              to="/julian"
+              to="/reviewer"
               className="text-slate-600 hover:text-slate-900"
             >
-              Reference Site
+              Reviewer Mode
             </Link>
             <Link
-              to="/chatgpt-recommendations"
+              to="/prompt-refinement"
               className="text-slate-600 hover:text-slate-900"
             >
-              LLM Recommendations
+              Prompt Refinement
             </Link>
           </nav>
         </div>
@@ -35,7 +35,6 @@ export default function App() {
 
       <main className="flex-1">
         <Routes>
-          <Route path="/julian" element={<JulianPagesPage />} />
           <Route
             path="/"
             element={
@@ -53,10 +52,18 @@ export default function App() {
             }
           />
           <Route
-            path="/chatgpt-recommendations"
+            path="/reviewer"
             element={
               <div className="mx-auto px-4 py-6">
-                <LLMRecommendationsPage />
+                <ReviewerModePage />
+              </div>
+            }
+          />
+          <Route
+            path="/prompt-refinement"
+            element={
+              <div className="mx-auto px-4 py-6">
+                <PromptRefinementPage />
               </div>
             }
           />

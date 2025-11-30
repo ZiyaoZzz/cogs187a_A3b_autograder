@@ -72,3 +72,58 @@ export interface AssignmentSummary {
   totalViolationsCount: number;
   uniqueHeuristicsCount: number;
 }
+
+// Reviewer Mode (HITL) types
+export interface OverrideRecord {
+  id: string;
+  jobId: string;
+  pageNumber: number;
+  field: string; // e.g., "score_breakdown.violation_quality.points", "feedback", "extracted_violations[0].severity"
+  originalValue: any;
+  overrideValue: any;
+  reviewerName?: string;
+  reviewerNotes?: string;
+  timestamp: string;
+}
+
+export interface PageAnalysisWithOverride extends PageAnalysisResult {
+  overrides?: OverrideRecord[];
+  hasOverrides?: boolean;
+}
+
+export interface ReviewerSubmission {
+  jobId: string;
+  fileName?: string;
+  createdAt: string;
+  pages: HeuristicExtractionPage[];
+  analysisResults: PageAnalysisWithOverride[];
+  totalOverrides?: number;
+}
+
+export interface AICorrection {
+  id: string;
+  jobId: string;
+  pageNumber: number;
+  component: string;
+  reason: string;
+  originalValue: any;
+  correctedValue: any;
+  reviewerNotes?: string;
+  timestamp: string;
+}
+
+export interface AIRiskPage {
+  pageNumber: number;
+  notes?: string;
+  timestamp?: string;
+  // Legacy fields (for backward compatibility, but not used for manual flags)
+  riskScore?: number;
+  flags?: string[];
+}
+
+export interface AIFlags {
+  jobId: string;
+  flags: any[];
+  riskPages: AIRiskPage[];
+  totalRiskPages: number;
+}
