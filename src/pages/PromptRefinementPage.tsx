@@ -42,6 +42,10 @@ export default function PromptRefinementPage() {
   const [refinementReport, setRefinementReport] = useState<string>("");
   const [autoFilledFromImprove, setAutoFilledFromImprove] = useState(false);
   const [savingPrompt, setSavingPrompt] = useState(false);
+  const [refinementMode, setRefinementMode] = useState<"classic" | "enhanced">("enhanced");
+  const [auditResult, setAuditResult] = useState<any>(null);
+  const [runningAudit, setRunningAudit] = useState(false);
+  const [enhancedRefinementResult, setEnhancedRefinementResult] = useState<any>(null);
 
   // Load current prompt from backend or from localStorage (if coming from Improve Prompt)
   useEffect(() => {
@@ -280,13 +284,121 @@ export default function PromptRefinementPage() {
     }
   };
 
+  const runRuthlessAudit = async () => {
+    if (!originalPrompt.trim()) {
+      setError("Please provide a prompt to audit.");
+      return;
+    }
+
+    setRunningAudit(true);
+    setError(null);
+    setAuditResult(null);
+
+    try {
+      const res = await fetch(`${API_BASE}/api/ruthless-audit`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          prompt: originalPrompt,
+          systemContext: "Autograder for UX/HCI heuristic evaluation assignments. System uses LLM (Gemini) to grade student submissions page-by-page, then aggregates into issues and final scores.",
+        }),
+      });
+
+      if (!res.ok) {
+        const errorData = await res.json().catch(() => ({}));
+        throw new Error(errorData.detail || "Failed to run ruthless audit");
+      }
+
+      const data = await res.json();
+      setAuditResult(data.audit);
+    } catch (err: any) {
+      setError(err.message || "Ruthless audit failed");
+    } finally {
+      setRunningAudit(false);
+    }
+  };
+
+  const runEnhancedRefinement = async () => {
+    if (!originalPrompt.trim()) {
+      setError("Please provide an original prompt to refine.");
+      return;
+    }
+
+    setLoading(true);
+    setError(null);
+    setFinalPrompt("");
+    setRefinementReport("");
+    setEnhancedRefinementResult(null);
+
+    try {
+      const res = await fetch(`${API_BASE}/api/enhanced-prompt-refinement`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          originalPrompt,
+          numPlans: 3,
+        }),
+      });
+
+      if (!res.ok) {
+        const errorData = await res.json().catch(() => ({}));
+        throw new Error(errorData.detail || "Failed to run enhanced refinement");
+      }
+
+      const data = await res.json();
+      setEnhancedRefinementResult(data);
+      setFinalPrompt(data.improved_prompt || "");
+      setRefinementReport(JSON.stringify({
+        plans: data.plans,
+        comparison: data.comparison,
+        best_combined_plan: data.best_combined_plan,
+      }, null, 2));
+    } catch (err: any) {
+      setError(err.message || "Enhanced refinement failed");
+    } finally {
+      setLoading(false);
+    }
+  };
+
   return (
     <div className="max-w-6xl mx-auto px-4 py-6">
       <h1 className="text-2xl font-bold text-slate-900 mb-6">Prompt Refinement Pipeline</h1>
-      <p className="text-sm text-slate-600 mb-6">
-        Use AI-to-AI critique to iteratively improve your grading prompt. Each AI critiques the other's prompt,
-        then both refine their prompts based on the critiques. Finally, a best prompt is synthesized.
-      </p>
+      
+      {/* Explanation Cards */}
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
+        <div className="p-4 bg-blue-50 border border-blue-200 rounded-lg">
+          <h3 className="text-sm font-semibold text-blue-900 mb-2">🔍 Ruthless Audit</h3>
+          <p className="text-xs text-blue-800">
+            <strong>What:</strong> Comprehensive quality gate review of your prompt
+            <br />
+            <strong>When:</strong> After major development, before refinement
+            <br />
+            <strong>Output:</strong> Architectural issues, governance violations, prioritized recommendations (P0/P1/P2)
+          </p>
+        </div>
+        
+        <div className="p-4 bg-indigo-50 border border-indigo-200 rounded-lg">
+          <h3 className="text-sm font-semibold text-indigo-900 mb-2">✨ Enhanced Refinement</h3>
+          <p className="text-xs text-indigo-800">
+            <strong>What:</strong> Generate 2-3 different improvement plans, compare them, synthesize best approach
+            <br />
+            <strong>When:</strong> Want multiple strategic options before improving
+            <br />
+            <strong>Output:</strong> Multiple plans → Comparison → Best combined prompt
+          </p>
+        </div>
+        
+        <div className="p-4 bg-purple-50 border border-purple-200 rounded-lg">
+          <h3 className="text-sm font-semibold text-purple-900 mb-2">🔄 Classic Refinement</h3>
+          <p className="text-xs text-purple-800">
+            <strong>What:</strong> Traditional AI-to-AI critique loop (Critic critiques → Designer refines → Judge selects)
+            <br />
+            <strong>When:</strong> Want iterative, step-by-step refinement
+            <br />
+            <strong>Output:</strong> Multiple prompt versions → Final best prompt
+          </p>
+        </div>
+      </div>
 
       {error && (
         <div className="mb-4 p-4 bg-red-50 border border-red-200 rounded-md">
@@ -343,28 +455,65 @@ export default function PromptRefinementPage() {
             </button>
           </div>
 
-          <div>
-            <label className="block text-sm font-medium text-slate-700 mb-2">
-              Iterations (Critique Rounds)
-            </label>
-            <select
-              value={iterations}
-              onChange={(e) => setIterations(parseInt(e.target.value, 10))}
-              disabled={loading || (session !== null && session.status !== "idle" && session.status !== "completed")}
-              className="w-full px-3 py-2 border border-slate-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
-            >
-              <option value={2}>Basic (P0→P1→P2→Judge)</option>
-              <option value={3}>Extended (P0→P1→P2→P3→P4→Judge)</option>
-            </select>
-          </div>
+          <div className="space-y-3">
+            <div>
+              <label className="block text-sm font-medium text-slate-700 mb-2">
+                Refinement Mode
+              </label>
+              <select
+                value={refinementMode}
+                onChange={(e) => setRefinementMode(e.target.value as "classic" | "enhanced")}
+                disabled={loading || runningAudit || (session !== null && session.status !== "idle" && session.status !== "completed")}
+                className="w-full px-3 py-2 border border-slate-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+              >
+                <option value="enhanced">✨ Enhanced: Multi-Plan Generation & Comparison</option>
+                <option value="classic">🔄 Classic: AI-to-AI Critique Loop</option>
+              </select>
+              <p className="mt-1 text-xs text-slate-500">
+                {refinementMode === "enhanced" 
+                  ? "Generates multiple improvement strategies, compares them, then synthesizes the best combined approach."
+                  : "Uses iterative AI-to-AI critique: one AI critiques, another refines, judge selects best version."}
+              </p>
+            </div>
 
-          <button
-            onClick={startRefinement}
-            disabled={loading || !originalPrompt.trim() || (session !== null && session.status !== "idle" && session.status !== "completed")}
-            className="w-full px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed"
-          >
-            {loading ? "Processing..." : session?.status === "completed" ? "Start New Refinement Process" : "Start Refinement Process"}
-          </button>
+            {refinementMode === "classic" && (
+              <div> 
+                <label className="block text-sm font-medium text-slate-700 mb-2">
+                  Iterations (Critique Rounds)
+                </label>
+                <select
+                  value={iterations}
+                  onChange={(e) => setIterations(parseInt(e.target.value, 10))}
+                  disabled={loading || (session !== null && session.status !== "idle" && session.status !== "completed")}
+                  className="w-full px-3 py-2 border border-slate-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+                >
+                  <option value={2}>Basic (P0→P1→P2→Judge)</option>
+                  <option value={3}>Extended (P0→P1→P2→P3→P4→Judge)</option>
+                </select>
+              </div>
+            )}
+
+            <button
+              onClick={refinementMode === "enhanced" ? runEnhancedRefinement : startRefinement}
+              disabled={loading || runningAudit || !originalPrompt.trim() || (session !== null && session.status !== "idle" && session.status !== "completed")}
+              className="w-full px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed font-medium"
+            >
+              {loading ? "Processing..." : refinementMode === "enhanced" ? "✨ Run Enhanced Refinement" : session?.status === "completed" ? "🔄 Start New Refinement Process" : "🔄 Start Classic Refinement"}
+            </button>
+
+            <div className="relative">
+              <button
+                onClick={runRuthlessAudit}
+                disabled={loading || runningAudit || !originalPrompt.trim()}
+                className="w-full px-4 py-2 bg-red-600 text-white rounded-md hover:bg-red-700 disabled:opacity-50 disabled:cursor-not-allowed font-medium"
+              >
+                {runningAudit ? "Running Audit..." : "🔍 Run Ruthless Multi-Panel Audit"}
+              </button>
+              <p className="mt-1 text-xs text-slate-500 text-center">
+                Run this first to identify issues before refinement
+              </p>
+            </div>
+          </div>
 
           {session && (
             <div className="p-4 bg-slate-50 rounded-lg border border-slate-200">
@@ -394,6 +543,87 @@ export default function PromptRefinementPage() {
 
         {/* Right: Version History and Final Prompt */}
         <div className="space-y-4">
+          {/* Ruthless Audit Results */}
+          {auditResult && (
+            <div className="p-4 bg-red-50 border border-red-200 rounded-lg">
+              <div className="flex items-center justify-between mb-2">
+                <h4 className="text-sm font-semibold text-red-900">🔍 Ruthless Audit Results</h4>
+                <button
+                  onClick={() => {
+                    // Auto-run refinement based on current mode
+                    if (refinementMode === "enhanced") {
+                      runEnhancedRefinement();
+                    } else {
+                      startRefinement();
+                    }
+                  }}
+                  disabled={loading || !originalPrompt.trim()}
+                  className="px-3 py-1 text-xs bg-blue-600 text-white rounded-md hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed font-medium"
+                >
+                  {refinementMode === "enhanced" ? "✨ Run Enhanced Refinement" : "🔄 Run Classic Refinement"}
+                </button>
+              </div>
+              <div className="text-xs text-red-800 space-y-2 max-h-96 overflow-y-auto">
+                <div>
+                  <strong>Summary:</strong> {auditResult.summary}
+                </div>
+                {auditResult.prioritized_recommendations && auditResult.prioritized_recommendations.length > 0 && (
+                  <div>
+                    <strong>Prioritized Recommendations:</strong>
+                    <ul className="list-disc list-inside mt-1 space-y-1">
+                      {auditResult.prioritized_recommendations.slice(0, 5).map((rec: any, idx: number) => (
+                        <li key={idx}>
+                          <strong>{rec.priority}:</strong> {rec.title} - {rec.description}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+                {auditResult.overall_assessment && (
+                  <div>
+                    <strong>Overall Assessment:</strong>
+                    <p className="mt-1">{auditResult.overall_assessment}</p>
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* Enhanced Refinement Results */}
+          {enhancedRefinementResult && (
+            <div className="p-4 bg-indigo-50 border border-indigo-200 rounded-lg">
+              <h4 className="text-sm font-semibold text-indigo-900 mb-2">📋 Enhanced Refinement: Plans & Comparison</h4>
+              <div className="text-xs text-indigo-800 space-y-3 max-h-96 overflow-y-auto">
+                {enhancedRefinementResult.plans && enhancedRefinementResult.plans.map((plan: any, idx: number) => (
+                  <div key={idx} className="bg-white p-3 rounded border border-indigo-100">
+                    <div className="font-semibold mb-1">{plan.strategy_name}</div>
+                    <div className="text-xs text-slate-600 mb-2">{plan.strategy_description}</div>
+                    <div className="text-xs">
+                      <strong>Expected Benefits:</strong> {plan.expected_benefits?.join(", ")}
+                    </div>
+                  </div>
+                ))}
+                {enhancedRefinementResult.comparison && (
+                  <div className="bg-white p-3 rounded border border-indigo-100">
+                    <div className="font-semibold mb-1">Comparison Analysis</div>
+                    <div className="text-xs whitespace-pre-wrap">
+                      {JSON.stringify(enhancedRefinementResult.comparison, null, 2).substring(0, 500)}...
+                    </div>
+                  </div>
+                )}
+                {enhancedRefinementResult.best_combined_plan && (
+                  <div className="bg-white p-3 rounded border border-indigo-100">
+                    <div className="font-semibold mb-1">Best Combined Plan: {enhancedRefinementResult.best_combined_plan.strategy_name}</div>
+                    <div className="text-xs text-slate-600 mb-2">{enhancedRefinementResult.best_combined_plan.strategy_description}</div>
+                    <div className="text-xs">
+                      <strong>Improvement Summary:</strong> {enhancedRefinementResult.best_combined_plan.improvement_summary}
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
           {session && session.versions.length > 0 && (
             <div>
               <label className="block text-sm font-medium text-slate-700 mb-2">
@@ -467,6 +697,42 @@ export default function PromptRefinementPage() {
             </div>
           )}
 
+
+          {/* Enhanced Refinement Results */}
+          {enhancedRefinementResult && (
+            <div className="mb-4 p-4 bg-indigo-50 border border-indigo-200 rounded-lg">
+              <h4 className="text-sm font-semibold text-indigo-900 mb-2">📋 Enhanced Refinement: Plans & Comparison</h4>
+              <div className="text-xs text-indigo-800 space-y-3 max-h-96 overflow-y-auto">
+                {enhancedRefinementResult.plans && enhancedRefinementResult.plans.map((plan: any, idx: number) => (
+                  <div key={idx} className="bg-white p-3 rounded border border-indigo-100">
+                    <div className="font-semibold mb-1">{plan.strategy_name}</div>
+                    <div className="text-xs text-slate-600 mb-2">{plan.strategy_description}</div>
+                    <div className="text-xs">
+                      <strong>Expected Benefits:</strong> {plan.expected_benefits?.join(", ")}
+                    </div>
+                  </div>
+                ))}
+                {enhancedRefinementResult.comparison && (
+                  <div className="bg-white p-3 rounded border border-indigo-100">
+                    <div className="font-semibold mb-1">Comparison Analysis</div>
+                    <div className="text-xs whitespace-pre-wrap">
+                      {JSON.stringify(enhancedRefinementResult.comparison, null, 2).substring(0, 500)}...
+                    </div>
+                  </div>
+                )}
+                {enhancedRefinementResult.best_combined_plan && (
+                  <div className="bg-white p-3 rounded border border-indigo-100">
+                    <div className="font-semibold mb-1">Best Combined Plan: {enhancedRefinementResult.best_combined_plan.strategy_name}</div>
+                    <div className="text-xs text-slate-600 mb-2">{enhancedRefinementResult.best_combined_plan.strategy_description}</div>
+                    <div className="text-xs">
+                      <strong>Improvement Summary:</strong> {enhancedRefinementResult.best_combined_plan.improvement_summary}
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
           {finalPrompt && (
             <div>
               {/* Judge's Scoring Table and Reasoning */}
@@ -516,9 +782,9 @@ export default function PromptRefinementPage() {
                     onClick={savePromptToBackend}
                     disabled={savingPrompt}
                     className="px-3 py-1 text-xs bg-indigo-600 text-white rounded-md hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed"
-                    title="Save this prompt permanently to backend (will be used as default for future analyses)"
+                    title="Update backend grading prompt (writes to output_static/grading_prompt.txt for future grading runs)"
                   >
-                    {savingPrompt ? "Saving..." : "Save to Backend"}
+                    {savingPrompt ? "Updating..." : "Update backend prompt"}
                   </button>
                 </div>
               </div>

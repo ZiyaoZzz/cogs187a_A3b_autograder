@@ -152,52 +152,49 @@ The system evaluates student submissions for Assignment 3A, which requires stude
 - Page type misclassification → Enhanced prompt with specific page type definitions
 - Severity extraction errors → Added multiple pattern matching for severity formats
 
-### 3.3 Human-in-the-Loop (HITL) Pipeline (`/reviewer`)
+### 3.3 Issue-Level Reviewer Mode (`/issue-reviewer`)
 
-**Purpose**: Allow TAs to review, correct, and override AI decisions
+**Purpose**: Let TAs inspect the consolidated issues (instead of raw pages), adjust AI rationale, leave rubric comments, and trigger a grading re-run.
 
 **Key Features**:
 
-1. **Page-by-Page Review**:
-   - Display PDF page images with AI analysis results
-   - Show extracted violations, scores, and feedback
-   - Navigate between pages with keyboard shortcuts
+1. **Issue-Centric Sidebar**:
+   - Issues grouped by heuristic, introduction/severity summary/conclusion buckets, and “Other Pages”.
+   - Each issue shows contributing pages with inline screenshots and structured analysis.
 
-2. **Override System**:
-   - Edit any score component (points and comments)
-   - Add reviewer notes explaining corrections
-   - Save overrides to `output_static/overrides/{jobId}_overrides.json`
-   - Real-time UI updates with visual feedback (green highlight on edited fields)
+2. **TA Review & Rubric Comments**:
+   - Per-issue grading controls (severity rationale, overrides, notes).
+   - Rubric component comment dropdown that feeds into the LLM scoring prompt.
+   - Persistent summary at the bottom showing everything the TA saved.
 
-3. **AI Error Reporting**:
-   - Report specific AI inaccuracies (component, original value, corrected value, reason)
-   - Corrections stored in `output_static/corrections/corrections.json`
-   - Used for prompt improvement analysis
+3. **AI Final Grading Panel**:
+   - Displays latest Stage-2 scoring output (overall + component/bonus scores).
+   - “Re-run grading” button calls the backend recompute endpoint (`/api/jobs/{jobId}/review/recompute`) without clearing TA reviews.
+   - Changes modal highlights score deltas and shows which rubric comments were injected into the prompt.
 
-4. **AI Risk Flags**:
-   - Automatically flag pages where TAs made corrections with notes
-   - Display flagged pages with detailed correction information
-   - Track override counts and pages with issues
+4. **Prompt Analysis Step**:
+   - “Generate analysis” button hits `/api/jobs/{jobId}/comment-prompt-analysis`.
+   - Produces structured summary / recommendations / draft prompt based purely on TA comments before deciding to rerun grading.
 
-5. **Prompt Improvement**:
-   - Generate improved prompts based on TA corrections
-   - Include page images and score changes in context
-   - Navigate directly to Prompt Refinement page with improved prompt
+5. **Job Switching & Auto-Sync**:
+   - Job selector dropdown populated from `/api/list-jobs`.
+   - `localStorage.recentJobIds` pre-selects the job that was just analyzed on the upload page.
+   - `useRef` guard prevents race conditions while loading pages/issues/scoring JSON.
 
 **Technical Implementation**:
-- Frontend: `ReviewerModePage.tsx` (1,566 lines)
-- Backend endpoints:
-  - `/api/list-jobs`: Get available submissions
-  - `/api/load-submission`: Load submission with overrides applied
-  - `/api/save-override`: Save TA corrections
-  - `/api/get-ai-flags`: Get risk flags for a submission
-  - `/api/improve-prompt`: Generate improved prompt from corrections
+- Frontend: `IssueReviewerPage.tsx` (~2,400 lines) with aggressive state resets on `jobId` changes, memoized JSON cleaning, and modal summaries.
+- Backend endpoints used:
+  - `/api/get-issues`, `/api/get-pages`, `/api/get-extraction-result`
+  - `/api/jobs/{jobId}/review/recompute`
+  - `/api/jobs/{jobId}/rubric-comments` (GET/POST)
+  - `/api/jobs/{jobId}/comment-prompt-analysis`
+  - `/api/save-grading-scores`, `/api/save-issue-scores`
 
 **Technical Challenges Overcome**:
-- CORS errors → Explicit origin whitelist configuration
-- Real-time state updates → Immediate local state updates + background refresh
-- Duplicate override prevention → Stricter duplicate checking in frontend and backend
-- Auto-save conflicts → Implemented `useRef` tracking to prevent duplicate auto-saves
+- Preventing stale data when switching jobs → `currentJobIdRef` checks before every `setState`.
+- Double re-run bug → separated score recompute from prompt analysis and removed auto-clearing of TA reviews.
+- Non-strict JSON from LLM → multi-level parsing + frontend cleaning for analysis summaries.
+- Ensuring re-run only happens once per new dataset → `hasAutoRecomputedRef` + state resets when new analysis files arrive.
 
 ### 3.4 Prompt Refinement Pipeline (`/prompt-refinement`)
 
@@ -672,10 +669,9 @@ cogs187a_A3b_autograder/
 │   ├── pages/
 │   │   ├── HomePage.tsx
 │   │   ├── UploadPage.tsx      # Main grading interface (2,064 lines)
-│   │   ├── ReviewerModePage.tsx # HITL pipeline (1,566 lines)
+│   │   ├── IssueReviewerPage.tsx # Issue-level HITL pipeline (~2,400 lines)
 │   │   ├── PromptRefinementPage.tsx # AI-to-AI critique (558 lines)
-│   │   ├── JulianPagesPage.tsx  # Reference site viewer
-│   │   └── LLMRecommendationsPage.tsx
+│   │   └── JulianPagesPage.tsx  # Reference site viewer
 │   └── lib/
 │       └── types.ts            # TypeScript type definitions
 ├── scripts/

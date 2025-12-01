@@ -6,9 +6,10 @@ import base64
 import io
 import re
 import time
+from datetime import datetime
 import pdfplumber
 from pathlib import Path
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
 import google.generativeai as genai
 from PIL import Image
@@ -45,6 +46,7 @@ else:
 
 # Load rubric (includes heuristics list)
 RUBRIC_PATH = Path(__file__).parent.parent / "rubrics" / "a3_rubric.json"
+RUBRIC_V2_PATH = Path(__file__).parent.parent / "rubrics" / "v2" / "a3_rubric_v2.json"
 RUBRIC_DATA = None
 if RUBRIC_PATH.exists():
     with open(RUBRIC_PATH, "r", encoding="utf-8") as f:
@@ -238,7 +240,7 @@ def extract_partial_json(json_str: str, page_number: int) -> Dict[str, Any]:
     bonus_scores = {}
     bonus_fields = ["bonus_ai_opportunities", "bonus_exceptional_quality"]
     # Default max points for bonus fields (defined once outside loop for efficiency)
-    bonus_max_points = {"bonus_ai_opportunities": 3, "bonus_exceptional_quality": 2}
+    bonus_max_points = {"bonus_ai_opportunities": 3, "bonus_exceptional_quality": 1}
     
     for field in bonus_fields:
         pattern = rf'"{field}"\s*:\s*\{{"points"\s*:\s*(\d+),\s*"max"\s*:\s*(\d+)(?:,\s*"comment"\s*:\s*"([^"]*)")?'
@@ -522,7 +524,7 @@ IMPORTANT: Keep ALL text fields SHORT to prevent JSON truncation:
   }},
   "bonus_scores": {{
     "bonus_ai_opportunities": {{"points": X, "max": 3, "comment": ""}},
-    "bonus_exceptional_quality": {{"points": X, "max": 2, "comment": ""}}
+    "bonus_exceptional_quality": {{"points": X, "max": 1, "comment": ""}}
   }}
 }}"""
     
@@ -532,6 +534,10 @@ IMPORTANT: Keep ALL text fields SHORT to prevent JSON truncation:
 # Directory to save analysis results
 ANALYSIS_OUTPUT_DIR = Path(__file__).parent.parent / "output_static" / "student_analyses"
 ANALYSIS_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# Directory to store pages and issues JSON files
+PAGES_ISSUES_DIR = Path(__file__).parent.parent / "output_static" / "pages_issues"
+PAGES_ISSUES_DIR.mkdir(parents=True, exist_ok=True)
 
 @app.post("/api/analyze-single-page")
 async def analyze_single_page(request: Dict[str, Any]) -> Dict[str, Any]:
@@ -559,26 +565,9 @@ async def analyze_single_page(request: Dict[str, Any]) -> Dict[str, Any]:
     job_id = request.get("jobId", f"job-{int(time.time() * 1000)}")
     
     try:
-        # Get current prompt (saved or default)
-        prompt_template = get_current_prompt()
-        
-        # Truncate page content to first 2500 chars
+        # Use new structured page analysis prompt
         truncated_content = snippet[:2500] + ("..." if len(snippet) > 2500 else "")
-        word_count = len(truncated_content.split())
-        
-        # Replace placeholders in prompt template with actual page data
-        prompt = prompt_template.replace("{page_number}", str(page_number))
-        prompt = prompt.replace("{page_content}", truncated_content)
-        prompt = prompt.replace("{word_count}", str(word_count))
-        prompt = prompt.replace("{has_image}", "true" if has_image else "false")
-        
-        # If prompt doesn't have placeholders, try to inject page content into STUDENT SUBMISSION section
-        if "{page_content}" not in prompt_template and "STUDENT SUBMISSION" in prompt_template:
-            import re
-            # Find and replace the STUDENT SUBMISSION section
-            pattern = r"(STUDENT SUBMISSION[^\n]*\n[^\n]*\n[^\n]*\n)(.*?)(?=\n═══|$)"
-            replacement = f"STUDENT SUBMISSION - PAGE {page_number}:\nContent: {word_count} words, Has image: {has_image}\n{truncated_content}"
-            prompt = re.sub(pattern, replacement, prompt, flags=re.DOTALL)
+        prompt = get_page_analysis_prompt(page_number, truncated_content, has_image)
         
         # Prepare content for Gemini
         content_parts = [prompt]
@@ -616,12 +605,46 @@ async def analyze_single_page(request: Dict[str, Any]) -> Dict[str, Any]:
             
             # Get response text - try multiple methods to extract text
             response_text = None
+            error_details = []
+            
+            # Check for safety filters or blocked content first
+            if hasattr(response, 'prompt_feedback'):
+                if response.prompt_feedback:
+                    if hasattr(response.prompt_feedback, 'block_reason'):
+                        if response.prompt_feedback.block_reason:
+                            error_details.append(f"Prompt blocked: {response.prompt_feedback.block_reason}")
+            
+            # Check candidates for finish reasons
+            if response.candidates and len(response.candidates) > 0:
+                candidate = response.candidates[0]
+                if hasattr(candidate, 'finish_reason'):
+                    if candidate.finish_reason and candidate.finish_reason != 1:  # 1 = STOP (normal)
+                        finish_reason_map = {
+                            0: "FINISH_REASON_UNSPECIFIED",
+                            2: "MAX_TOKENS",
+                            3: "SAFETY",
+                            4: "RECITATION",
+                            5: "OTHER"
+                        }
+                        reason = finish_reason_map.get(candidate.finish_reason, f"Unknown ({candidate.finish_reason})")
+                        error_details.append(f"Finish reason: {reason}")
+                
+                # Check safety ratings
+                if hasattr(candidate, 'safety_ratings'):
+                    if candidate.safety_ratings:
+                        blocked_categories = []
+                        for rating in candidate.safety_ratings:
+                            if hasattr(rating, 'blocked') and rating.blocked:
+                                category = getattr(rating, 'category', 'UNKNOWN')
+                                blocked_categories.append(str(category))
+                        if blocked_categories:
+                            error_details.append(f"Content blocked by safety filters: {', '.join(blocked_categories)}")
             
             # Method 1: Try response.text (standard method)
             try:
                 response_text = response.text
             except (ValueError, AttributeError) as e:
-                pass
+                error_details.append(f"Method 1 (response.text) failed: {type(e).__name__}: {str(e)}")
             
             # Method 2: If that fails, try to extract from candidates directly
             if not response_text and response.candidates and len(response.candidates) > 0:
@@ -635,8 +658,8 @@ async def analyze_single_page(request: Dict[str, Any]) -> Dict[str, Any]:
                                     parts_text.append(part.text)
                             if parts_text:
                                 response_text = "".join(parts_text)
-                except Exception:
-                    pass
+                except Exception as e:
+                    error_details.append(f"Method 2 (candidates.parts) failed: {type(e).__name__}: {str(e)}")
             
             # Method 3: Try to get any text from the response object
             if not response_text:
@@ -645,21 +668,35 @@ async def analyze_single_page(request: Dict[str, Any]) -> Dict[str, Any]:
                     response_text = str(response)
                     # If it's just the object representation, try candidates again
                     if response_text.startswith('<') or 'object at' in response_text:
+                        response_text = None  # Reset if it's just object representation
                         if response.candidates:
                             for candidate in response.candidates:
                                 try:
                                     if hasattr(candidate, 'content'):
                                         content_str = str(candidate.content)
-                                        if content_str and len(content_str) > 50:
+                                        if content_str and len(content_str) > 50 and not content_str.startswith('<'):
                                             response_text = content_str
                                             break
                                 except Exception:
                                     continue
-                except Exception:
-                    pass
+                except Exception as e:
+                    error_details.append(f"Method 3 (str conversion) failed: {type(e).__name__}: {str(e)}")
             
             # If we still don't have text, create a meaningful error response
             if not response_text or len(response_text.strip()) < 10:
+                error_msg = "Could not extract text from Gemini response"
+                if error_details:
+                    error_msg += f". Details: {'; '.join(error_details)}"
+                else:
+                    error_msg += ". Response structure may have changed or content was filtered."
+                
+                print(f"[ERROR] Page {page_number}: {error_msg}")
+                print(f"[DEBUG] Response object type: {type(response)}")
+                print(f"[DEBUG] Response has candidates: {hasattr(response, 'candidates') and response.candidates}")
+                if hasattr(response, 'candidates') and response.candidates:
+                    print(f"[DEBUG] First candidate type: {type(response.candidates[0])}")
+                    print(f"[DEBUG] First candidate finish_reason: {getattr(response.candidates[0], 'finish_reason', 'N/A')}")
+                
                 # Return a structured response indicating the issue
                 return {
                     "status": "completed",
@@ -667,8 +704,9 @@ async def analyze_single_page(request: Dict[str, Any]) -> Dict[str, Any]:
                         "page_number": page_number,
                         "skip_analysis": False,
                         "page_type": "Analysis Error",
-                        "feedback": f"Unable to extract response from Gemini API for page {page_number}. The API may have returned an unexpected format. Please try analyzing this page again.",
-                        "error": "Could not extract text from Gemini response",
+                        "feedback": f"Unable to extract response from Gemini API for page {page_number}. {error_msg}",
+                        "error": error_msg,
+                        "error_details": error_details if error_details else None,
                         "score_breakdown": {
                             "coverage": {"points": 0, "max": 15, "comment": "Unable to analyze - API response issue"},
                             "violation_quality": {"points": 0, "max": 20, "comment": "Unable to analyze - API response issue"},
@@ -741,6 +779,17 @@ async def analyze_single_page(request: Dict[str, Any]) -> Dict[str, Any]:
             # Ensure page_number is always set correctly (LLM might return wrong or missing page_number)
             if "page_number" not in analysis_json or analysis_json.get("page_number") != page_number:
                 analysis_json["page_number"] = page_number
+            
+            # Create a copy of structured analysis before converting
+            structured_analysis = dict(analysis_json)  # Keep new format
+            
+            # Convert new PageAnalysis format to legacy PageAnalysisResult format for backward compatibility
+            legacy_result = convert_page_analysis_to_legacy(analysis_json, page_number)
+            
+            # Include both formats in response
+            final_result = dict(legacy_result)  # Start with legacy format
+            final_result["structured_analysis"] = structured_analysis  # Add new format
+            analysis_json = final_result
             
             # Save analysis result to JSON file
             try:
@@ -820,7 +869,7 @@ async def get_extraction_result(jobId: str) -> Dict[str, Any]:
     if extraction_file.exists():
         with open(extraction_file, "r", encoding="utf-8") as f:
             data = json.load(f)
-            # Normalize field names: convert image_base64 to imageBase64
+            # Normalize field names: convert image_base64 to imageBase64 and page_number to pageNumber
             pages = data.get("pages", [])
             normalized_pages = []
             for page in pages:
@@ -828,6 +877,9 @@ async def get_extraction_result(jobId: str) -> Dict[str, Any]:
                 # Convert image_base64 to imageBase64 for frontend compatibility
                 if "image_base64" in normalized_page and "imageBase64" not in normalized_page:
                     normalized_page["imageBase64"] = normalized_page["image_base64"]
+                # Convert page_number to pageNumber for frontend compatibility
+                if "page_number" in normalized_page and "pageNumber" not in normalized_page:
+                    normalized_page["pageNumber"] = normalized_page["page_number"]
                 normalized_pages.append(normalized_page)
             
             return {
@@ -863,6 +915,45 @@ async def get_analysis_results(jobId: str) -> Dict[str, Any]:
     # Sort by page number
     results.sort(key=lambda x: x.get("page_number", 0))
     
+    # Save pages.json after loading all results
+    try:
+        pages_data = []
+        for result in results:
+            structured = result.get("structured_analysis")
+            if structured:
+                pages_data.append(structured)
+        
+        if pages_data:
+            pages_file = PAGES_ISSUES_DIR / f"{jobId}_pages.json"
+            with open(pages_file, "w", encoding="utf-8") as f:
+                json.dump(pages_data, f, indent=2, ensure_ascii=False)
+            
+            # Aggregate issues and save
+            issues = aggregate_issues(pages_data)
+            issues_file = PAGES_ISSUES_DIR / f"{jobId}_issues.json"
+            
+            # Load existing issues to preserve TA reviews
+            existing_issues = []
+            if issues_file.exists():
+                try:
+                    with open(issues_file, "r", encoding="utf-8") as f:
+                        existing_issues_data = json.load(f)
+                        existing_issues = existing_issues_data.get("issues", [])
+                except Exception:
+                    pass
+            
+            # Merge TA reviews from existing issues
+            existing_issues_dict = {issue.get("issue_id"): issue for issue in existing_issues}
+            for issue in issues:
+                existing_issue = existing_issues_dict.get(issue["issue_id"])
+                if existing_issue and existing_issue.get("ta_review"):
+                    issue["ta_review"] = existing_issue["ta_review"]
+            
+            with open(issues_file, "w", encoding="utf-8") as f:
+                json.dump({"issues": issues}, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"Warning: Failed to save pages/issues JSON: {e}")
+    
     return {"jobId": jobId, "results": results}
 
 
@@ -877,6 +968,1767 @@ async def get_overrides(jobId: str) -> Dict[str, Any]:
             return {"jobId": jobId, "overrides": data.get("overrides", [])}
     
     return {"jobId": jobId, "overrides": []}
+
+
+@app.get("/api/get-issues")
+async def get_issues(jobId: str = Query(..., description="Job ID to get issues for")) -> Dict[str, Any]:
+    """Get all issues for a job ID (after aggregation)."""
+    print(f"[DEBUG] get_issues called with jobId: {jobId}")
+    issues_file = PAGES_ISSUES_DIR / f"{jobId}_issues.json"
+    
+    if issues_file.exists():
+        try:
+            with open(issues_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return {"jobId": jobId, "issues": data.get("issues", [])}
+        except Exception as e:
+            print(f"Error loading issues: {e}")
+    
+    # If no issues file exists, try to generate from pages
+    pages_file = PAGES_ISSUES_DIR / f"{jobId}_pages.json"
+    if pages_file.exists():
+        try:
+            with open(pages_file, "r", encoding="utf-8") as f:
+                pages_data = json.load(f)
+                issues = aggregate_issues(pages_data)
+                # Save the generated issues
+                issues_file = PAGES_ISSUES_DIR / f"{jobId}_issues.json"
+                with open(issues_file, "w", encoding="utf-8") as f:
+                    json.dump({"issues": issues}, f, indent=2, ensure_ascii=False)
+                return {"jobId": jobId, "issues": issues}
+        except Exception as e:
+            print(f"Error generating issues from pages: {e}")
+    
+    return {"jobId": jobId, "issues": []}
+
+
+@app.patch("/api/update-issue-review")
+async def update_issue_review(request: Dict[str, Any]) -> Dict[str, Any]:
+    """Update TA review for a specific issue."""
+    job_id = request.get("jobId")
+    issue_id = request.get("issueId")
+    ta_review = request.get("ta_review")
+    
+    if not job_id or not issue_id:
+        raise HTTPException(status_code=400, detail="jobId and issueId are required")
+    
+    issues_file = PAGES_ISSUES_DIR / f"{job_id}_issues.json"
+    
+    if not issues_file.exists():
+        raise HTTPException(status_code=404, detail="Issues file not found. Please run analysis first.")
+    
+    try:
+        with open(issues_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            issues = data.get("issues", [])
+        
+        # Find and update the issue
+        issue_found = False
+        for issue in issues:
+            if issue.get("issue_id") == issue_id:
+                issue["ta_review"] = ta_review
+                issue_found = True
+                break
+        
+        if not issue_found:
+            raise HTTPException(status_code=404, detail=f"Issue {issue_id} not found")
+        
+        # Save back
+        with open(issues_file, "w", encoding="utf-8") as f:
+            json.dump({"issues": issues}, f, indent=2, ensure_ascii=False)
+        
+        return {
+            "status": "success",
+            "jobId": job_id,
+            "issueId": issue_id,
+            "ta_review": ta_review,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error updating issue review: {str(e)}")
+
+
+def calculate_grading_scores(pages: List[Dict[str, Any]], issues: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Calculate grading scores based on pages and issues metadata.
+    Returns a dictionary with scores for each rubric criterion.
+    """
+    scores = {
+        "coverage": {"points": 0, "max": 15, "comment": ""},
+        "violation_quality": {"points": 0, "max": 20, "comment": ""},
+        "screenshots": {"points": 0, "max": 10, "comment": ""},
+        "severity_analysis": {"points": 0, "max": 10, "comment": ""},
+        "structure_navigation": {"points": 0, "max": 10, "comment": ""},
+        "professional_quality": {"points": 0, "max": 10, "comment": ""},
+        "writing_quality": {"points": 0, "max": 10, "comment": ""},
+        "group_integration": {"points": 0, "max": 15, "comment": ""},
+        "bonus_ai_opportunities": {"points": 0, "max": 3, "comment": ""},
+        "bonus_exceptional_quality": {"points": 0, "max": 1, "comment": ""},
+    }
+    
+    if not pages or not issues:
+        return scores
+    
+    # Coverage: Count unique heuristics and violations
+    unique_heuristics = set()
+    for issue in issues:
+        if issue.get("heuristic_id") and not issue.get("heuristic_id", "").startswith("Hx"):
+            unique_heuristics.add(issue.get("heuristic_id"))
+    
+    coverage_score = 15
+    if len(unique_heuristics) < 10:
+        coverage_score -= 5
+    if len(issues) < 12:
+        coverage_score -= 5
+    if len(unique_heuristics) < 8:
+        coverage_score -= 2
+    if len(issues) < 10:
+        coverage_score -= 2
+    scores["coverage"]["points"] = max(0, coverage_score)
+    scores["coverage"]["comment"] = f"Found {len(unique_heuristics)}/10 heuristics, {len(issues)} issues"
+    
+    # Violation Quality: Based on rubric_relevance from violation_detail pages
+    violation_pages = [p for p in pages if p.get("page_role") == "violation_detail"]
+    if violation_pages:
+        violation_quality_levels = [p.get("rubric_relevance", {}).get("violation_quality", "none") for p in violation_pages]
+        level_scores = {"high": 20, "med": 15, "low": 10, "none": 0}
+        avg_score = sum(level_scores.get(level, 0) for level in violation_quality_levels) / len(violation_quality_levels) if violation_quality_levels else 0
+        scores["violation_quality"]["points"] = round(avg_score)
+        scores["violation_quality"]["comment"] = f"Average relevance: {sum(1 for l in violation_quality_levels if l == 'high')} high, {sum(1 for l in violation_quality_levels if l == 'med')} med"
+    
+    # Screenshots & Evidence: Based on has_annotations from violation_detail pages
+    if violation_pages:
+        annotation_levels = [p.get("has_annotations", "none") for p in violation_pages]
+        annotation_scores = {"high": 10, "medium": 8, "low": 5, "none": 2}
+        avg_score = sum(annotation_scores.get(level, 0) for level in annotation_levels) / len(annotation_levels) if annotation_levels else 0
+        scores["screenshots"]["points"] = round(avg_score)
+        scores["screenshots"]["comment"] = f"Annotation levels: {sum(1 for l in annotation_levels if l == 'high')} high, {sum(1 for l in annotation_levels if l == 'medium')} medium"
+    
+    # Severity Analysis: Check for severity_summary pages and rubric_relevance
+    severity_pages = [p for p in pages if p.get("page_role") == "severity_summary"]
+    if severity_pages:
+        severity_levels = [p.get("rubric_relevance", {}).get("severity_analysis", "none") for p in severity_pages]
+        level_scores = {"high": 10, "med": 7, "low": 4, "none": 0}
+        avg_score = sum(level_scores.get(level, 0) for level in severity_levels) / len(severity_levels) if severity_levels else 0
+        scores["severity_analysis"]["points"] = round(avg_score)
+        scores["severity_analysis"]["comment"] = f"Found {len(severity_pages)} severity summary page(s)"
+    else:
+        scores["severity_analysis"]["points"] = 5
+        scores["severity_analysis"]["comment"] = "No severity summary page found"
+    
+    # Structure & Navigation: Based on rubric_relevance
+    structure_levels = [p.get("rubric_relevance", {}).get("structure_navigation", "none") for p in pages]
+    if structure_levels:
+        level_scores = {"high": 10, "med": 7, "low": 4, "none": 2}
+        avg_score = sum(level_scores.get(level, 0) for level in structure_levels) / len(structure_levels)
+        scores["structure_navigation"]["points"] = round(avg_score)
+        scores["structure_navigation"]["comment"] = f"Average structure relevance: {sum(1 for l in structure_levels if l == 'high')} high"
+    
+    # Professional Quality: Based on rubric_relevance
+    professional_levels = [p.get("rubric_relevance", {}).get("professional_quality", "none") for p in pages]
+    if professional_levels:
+        level_scores = {"high": 10, "med": 7, "low": 4, "none": 2}
+        avg_score = sum(level_scores.get(level, 0) for level in professional_levels) / len(professional_levels)
+        scores["professional_quality"]["points"] = round(avg_score)
+        scores["professional_quality"]["comment"] = f"Average professional quality: {sum(1 for l in professional_levels if l == 'high')} high"
+    
+    # Writing Quality: Based on rubric_relevance
+    writing_levels = [p.get("rubric_relevance", {}).get("writing_quality", "none") for p in pages]
+    if writing_levels:
+        level_scores = {"high": 10, "med": 7, "low": 4, "none": 2}
+        avg_score = sum(level_scores.get(level, 0) for level in writing_levels) / len(writing_levels)
+        scores["writing_quality"]["points"] = round(avg_score)
+        scores["writing_quality"]["comment"] = f"Average writing quality: {sum(1 for l in writing_levels if l == 'high')} high"
+    
+    # Group Integration: Based on rubric_relevance from intro/group_collab pages
+    group_pages = [p for p in pages if p.get("page_role") in ["intro", "group_collab"]]
+    if group_pages:
+        group_levels = [p.get("rubric_relevance", {}).get("group_integration", "none") for p in group_pages]
+        level_scores = {"high": 15, "med": 10, "low": 5, "none": 0}
+        avg_score = sum(level_scores.get(level, 0) for level in group_levels) / len(group_levels) if group_levels else 0
+        scores["group_integration"]["points"] = round(avg_score)
+        scores["group_integration"]["comment"] = f"Found {len(group_pages)} group-related page(s)"
+    else:
+        scores["group_integration"]["points"] = 5
+        scores["group_integration"]["comment"] = "No group integration pages found"
+    
+    return scores
+
+
+@app.get("/api/calculate-grading-scores")
+async def calculate_grading_scores_endpoint(jobId: str) -> Dict[str, Any]:
+    """Calculate grading scores based on pages and issues metadata."""
+    pages_file = PAGES_ISSUES_DIR / f"{jobId}_pages.json"
+    issues_file = PAGES_ISSUES_DIR / f"{jobId}_issues.json"
+    
+    pages = []
+    issues = []
+    
+    if pages_file.exists():
+        try:
+            with open(pages_file, "r", encoding="utf-8") as f:
+                pages_data = json.load(f)
+                pages = pages_data.get("pages", [])
+        except Exception as e:
+            print(f"Error loading pages: {e}")
+    
+    if issues_file.exists():
+        try:
+            with open(issues_file, "r", encoding="utf-8") as f:
+                issues_data = json.load(f)
+                issues = issues_data.get("issues", [])
+        except Exception as e:
+            print(f"Error loading issues: {e}")
+    
+    scores = calculate_grading_scores(pages, issues)
+    
+    # Load saved TA scores if they exist
+    scores_file = PAGES_ISSUES_DIR / f"{jobId}_scores.json"
+    if scores_file.exists():
+        try:
+            with open(scores_file, "r", encoding="utf-8") as f:
+                saved_scores = json.load(f)
+                # Merge saved TA scores with calculated scores
+                for key in scores:
+                    if key in saved_scores and "ta_points" in saved_scores[key]:
+                        scores[key]["ta_points"] = saved_scores[key]["ta_points"]
+                        scores[key]["ta_comment"] = saved_scores[key].get("ta_comment", "")
+        except Exception as e:
+            print(f"Error loading saved scores: {e}")
+    
+    return {"jobId": jobId, "scores": scores}
+
+
+# ============================================================================
+# LLM-based Final Scoring System
+# ============================================================================
+
+def get_rubric_brief() -> str:
+    """Return a brief description of the rubric components with max points from rubric."""
+    return """Rubric components with maximum points:
+- Coverage (max 15 points): Count-based evaluation. Full marks for 10 heuristics AND 12+ distinct violations. Deduct points if fewer heuristics or violations.
+- Violation Quality (max 20 points): Evaluated on heuristic violation pages. Clarity and depth of problem descriptions and user impact analysis.
+- Severity Analysis (max 10 points): Evaluated on heuristic violation pages. How well they justify severity levels (minor/major/critical) and provide clear reasoning.
+- Screenshots & Evidence (max 10 points): Evaluated on heuristic violation pages. How clearly screenshots/annotations support their claims. Annotations should be clear and informative.
+- Structure & Navigation (max 10 points): Evaluated on heuristic violation pages. How well they analyze structural/navigation issues in the interface.
+- Professional Quality (max 10 points): Evaluated on intro/group pages AND overall. Visual organization, slide layout, use of headings, color, spacing, overall presentation quality.
+- Writing Quality (max 10 points): Evaluated on intro/group pages AND overall. Clarity, grammar, and structure of explanations. Text should be clear and well-organized.
+- Group Integration (max 15 points): Evaluated ONLY on intro/group collaboration pages. Explanation of group collaboration, how work fits together, and division of responsibilities.
+
+Bonus criteria (optional, evaluated based on overall quality):
+- Bonus AI Opportunities (max 3 points): Thoughtful discussion of how AI could improve UX.
+- Bonus Exceptional Quality (max 2 points): Work significantly exceeds expectations."""
+
+
+def load_pages_for_job(job_id: str) -> List[Dict[str, Any]]:
+    """Load pages.json for a given job."""
+    pages_file = PAGES_ISSUES_DIR / f"{job_id}_pages.json"
+    if pages_file.exists():
+        try:
+            with open(pages_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                # Handle both formats: {"pages": [...]} and [...]
+                if isinstance(data, list):
+                    return data
+                elif isinstance(data, dict):
+                    return data.get("pages", [])
+                else:
+                    return []
+        except Exception as e:
+            print(f"Error loading pages for job {job_id}: {e}")
+            return []
+    return []
+
+
+def load_issues_for_job(job_id: str) -> List[Dict[str, Any]]:
+    """Load issues.json for a given job."""
+    issues_file = PAGES_ISSUES_DIR / f"{job_id}_issues.json"
+    if issues_file.exists():
+        try:
+            with open(issues_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                # Handle both formats: {"issues": [...]} and [...]
+                if isinstance(data, list):
+                    return data
+                elif isinstance(data, dict):
+                    return data.get("issues", [])
+                else:
+                    return []
+        except Exception as e:
+            print(f"Error loading issues for job {job_id}: {e}")
+            return []
+    return []
+
+
+def build_scoring_input(job_id: str, pages: List[Dict[str, Any]], issues: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Build ScoringInput object from pages and issues."""
+    scoring_issues = []
+    for issue in issues:
+        scoring_issue = {
+            "issue_id": issue.get("issue_id", ""),
+            "heuristic_id": issue.get("heuristic_id", ""),
+            "title": issue.get("title", ""),
+            "combined_description": issue.get("combined_description", ""),
+            "pages_involved": issue.get("pages_involved", []),
+            "ai_proposed_severity": issue.get("ai_proposed_severity", "major"),
+            "ai_rubric_scores": issue.get("ai_rubric_scores"),  # Optional
+        }
+        # Add TA review if present
+        if issue.get("ta_review"):
+            ta_review = issue["ta_review"]
+            scoring_issue["ta_review"] = {
+                "final_severity": ta_review.get("final_severity", "major"),
+                "final_issue_score_0_4": ta_review.get("final_score_0_4", 2),
+                "rubric_overrides": ta_review.get("rubric_overrides"),  # Optional
+                "override_reason": ta_review.get("override_reason", ""),
+                "ta_comment": ta_review.get("ta_comment", ""),
+            }
+        scoring_issues.append(scoring_issue)
+    
+    # Count pages by role for metadata
+    page_roles = {}
+    for page in pages:
+        role = page.get("page_role", "other")
+        page_roles[role] = page_roles.get(role, 0) + 1
+    
+    # Count unique heuristics for coverage calculation
+    unique_heuristics = set()
+    for issue in issues:
+        heuristic_id = issue.get("heuristic_id", "")
+        if heuristic_id and not heuristic_id.startswith("Hx"):
+            unique_heuristics.add(heuristic_id)
+    
+    # Collect AI opportunities pages
+    ai_opportunities_pages = []
+    for page in pages:
+        if page.get("page_role") == "ai_opportunities" and page.get("ai_opportunities_info"):
+            ai_info = page["ai_opportunities_info"]
+            if ai_info.get("present") is True:
+                ai_opportunities_pages.append({
+                    "page_id": page.get("page_id", ""),
+                    "llm_summary": ai_info.get("llm_summary", ""),
+                    "raw_text_excerpt": ai_info.get("raw_text_excerpt", ""),
+                    "relevance_to_violations": ai_info.get("relevance_to_violations", "low"),
+                    "specificity": ai_info.get("specificity", "generic"),
+                })
+    
+    # Collect pages with rubric_relevance for scoring guidance
+    pages_for_scoring = []
+    for page in pages:
+        page_data = {
+            "page_id": page.get("page_id", ""),
+            "page_number": page.get("page_number", 0),
+            "page_role": page.get("page_role", "other"),
+            "has_annotations": page.get("has_annotations", "none"),  # CRITICAL for Screenshots & Evidence scoring
+            "rubric_relevance": page.get("rubric_relevance", {}),
+        }
+        # Include main_heading if present
+        if page.get("main_heading"):
+            page_data["main_heading"] = page.get("main_heading")
+        # Include text content for Professional Quality and Writing Quality evaluation
+        if page.get("page_role") in ["intro", "group_collab"]:
+            page_data["llm_summary"] = page.get("llm_summary", "")
+            page_data["raw_text_excerpt"] = page.get("raw_text_excerpt", "")
+        pages_for_scoring.append(page_data)
+    
+    result = {
+        "job_id": job_id,
+        "rubric_brief": get_rubric_brief(),
+        "submission_meta": {
+            "num_pages": len(pages),
+            "num_issues": len(issues),
+            "num_heuristics": len(unique_heuristics),
+            "page_roles": page_roles,  # e.g., {"violation_detail": 8, "intro": 1, "group_collab": 1}
+        },
+        "issues": scoring_issues,
+        "pages": pages_for_scoring,  # Include pages with rubric_relevance for scoring guidance
+    }
+    
+    # Only include ai_opportunities_pages if there are any
+    if ai_opportunities_pages:
+        result["ai_opportunities_pages"] = ai_opportunities_pages
+    
+    return result
+
+
+async def call_grading_llm(scoring_input: Dict[str, Any]) -> str:
+    """Call LLM with grading prompt and return JSON response."""
+    if not MODEL:
+        raise HTTPException(status_code=500, detail="Gemini model not initialized. Please set GEMINI_API_KEY.")
+    
+    # Load the modularized grading prompt from file
+    grading_prompt_content = get_current_prompt()
+    
+    # Replace the placeholder for ScoringInput JSON
+    if "{json.dumps(scoring_input, indent=2)}" in grading_prompt_content:
+        prompt = grading_prompt_content.replace(
+            "{json.dumps(scoring_input, indent=2)}",
+            json.dumps(scoring_input, indent=2)
+        )
+    else:
+        # Fallback to old prompt structure if file doesn't have the new format
+        # Use the old prompt structure as fallback
+        prompt = f"""You are grading a heuristic evaluation assignment for a UX/HCI course.
+
+{get_rubric_brief()}
+
+IMPORTANT EVALUATION RULES:
+1. Coverage: Use submission_meta.num_heuristics and submission_meta.num_issues to score:
+   - 10 heuristics AND 12+ issues → 15 points
+   - 9-10 heuristics AND 10-11 issues → 12 points
+   - 8-9 heuristics OR 8-9 issues → 8 points
+   - Less than 8 heuristics OR less than 8 issues → 5 points or less
+
+**CRITICAL: AGGREGATION STRATEGY FOR COMPONENT SCORES**
+
+For components evaluated across multiple issues/pages (Violation Quality, Severity Analysis, Screenshots & Evidence, Structure & Navigation), you must use the **MINIMUM RULE** to combine scores:
+
+- **Final component score = minimum score observed across all issues/pages (bounded by max)**
+- If all issues/pages have max score → give max
+- Otherwise, final score = min(individual scores) from all issues/pages
+- This ensures that one weak issue/page cannot be compensated by strong ones
+
+**Example:**
+- Issue 1: Violation Quality = 18/20
+- Issue 2: Violation Quality = 15/20
+- Issue 3: Violation Quality = 20/20
+- **Final Violation Quality = 15/20** (minimum of 18, 15, 20)
+
+This aggregation strategy applies to:
+- Violation Quality (max 20)
+- Severity Analysis (max 10)
+- Screenshots & Evidence (max 10)
+- Structure & Navigation (max 10)
+
+2. Heuristic Pages (violation_detail pages): Evaluate these components:
+   
+   **Violation Quality (max 20 points):** Evaluate based on clarity, depth, and cognitive reasoning in problem descriptions.
+   
+   CRITICAL EVALUATION CRITERIA:
+   - **Explicit connection to user impacts**: Descriptions should explicitly connect problems to measurable user impacts or contextual user goals. Deduct points if descriptions are vague or lack concrete impact statements.
+   - **Cognitive mechanism analysis**: This is VERY IMPORTANT. Analysis must elaborate on cognitive mechanisms behind frustration or confusion (e.g., cognitive load, error tolerance, memory constraints, perception issues). Deduct significantly if analysis only uses surface-level descriptions like "confusing" or "frustrating" without connecting to core UX principles or cognitive mechanisms.
+   - **Breakdown analysis**: Must discuss why issues cause breakdowns in perception, memory, or action. Deduct points if this is missing.
+   - **Severity rating accuracy**: Some severity ratings may be inflated (many marked "major" even when impact = mild). Evaluate whether severity ratings are justified based on actual impact.
+   - **Depth vs. surface-level**: Deduct points if analysis leans on surface-level description without deeper articulation of cognitive cost or UX principles.
+   - **Cosmetic vs. heuristic issues**: Distinguish between cosmetic issues (e.g., card spacing) and true heuristic mismatches. Minor cosmetic issues should not be treated as major violations.
+   
+   Scoring guidance:
+   - 18-20: Excellent cognitive reasoning, explicit user impact connections, accurate severity ratings, deep UX principle analysis
+   - 15-17: Good analysis with cognitive reasoning present, may have minor gaps in explicit impact connections or slight severity inflation. This is a strong score for solid work.
+   - 12-14: Adequate descriptions with some cognitive mechanisms mentioned, may lack explicit impact connections but shows understanding of UX principles
+   - 10-11: Basic descriptions with minimal cognitive reasoning, some surface-level analysis but demonstrates understanding
+   - 8-9: Surface-level descriptions without much cognitive reasoning, but still identifies valid issues
+   - 0-7: Poor quality, minimal analysis, no cognitive reasoning, mostly cosmetic issues
+   
+   **Severity Analysis (max 10 points):** Evaluate based on justification of severity levels and transparency of severity weighting.
+   
+   CRITICAL EVALUATION CRITERIA:
+   - **Severity scale explanation**: It would be helpful to include a one-sentence explanation of how the 1–4 scale (or minor/major/critical scale) was applied (e.g., impact × frequency × persistence) to make severity weighting more transparent. If this explanation is missing, consider it a minor gap but don't deduct heavily (maybe 0.5-1 point).
+   - **Rationale for severity**: Should include a short rationale connecting frequency of occurrence or user impact to severity to demonstrate nuanced prioritization. If severity is assigned with basic justification (even if not detailed), that's acceptable.
+   - **Beyond "confusing" or "frustrating"**: Severity reasoning should go beyond just saying "confusing" or "frustrating" - should explain WHY it's confusing/frustrating and how that relates to severity. However, if there's some reasoning even if not fully detailed, that's acceptable.
+   
+   Scoring guidance:
+   - 10: Clear severity scale explanation, detailed rationale connecting impact/frequency to severity
+   - 9: Good rationale provided, may be missing scale explanation but has clear impact connection
+   - 8: Basic severity assignment with some rationale, may lack detailed explanation but shows understanding
+   - 7-8: Severity assigned with basic justification, demonstrates understanding of severity concepts
+   - 6-7: Minimal severity reasoning but still attempts to justify severity levels
+   - 0-5: No clear severity reasoning or missing severity analysis
+   
+   **Screenshots & Evidence (max 10 points):** Evaluate based on annotation quality, readability, and effectiveness as communication tools.
+   
+   CRITICAL EVALUATION CRITERIA:
+   - **Readability**: Some notes may be barely readable. Deduct points for poor readability (small font, low contrast, unclear handwriting).
+   - **Consistency**: Inconsistent font size across annotations reduces professionalism. Deduct points for inconsistency.
+   - **Communication tool vs. personal sketch**: Notes should be used as communication tools, not personal sketches. Deduct points if annotations are too informal or unclear for others to understand.
+   - **Minimal annotation**: Minimal notes and annotations to communicate the problem reduce effectiveness. Deduct points if annotations are too sparse or don't clearly indicate the problem.
+   - **Clear problem indication**: Annotations should clearly point to and explain the problem. Deduct points if annotations are vague or don't connect to the described issue.
+   
+   Scoring guidance:
+   - 10: Clear, readable, consistent annotations that effectively communicate problems
+   - 9: Good annotations but may have minor readability or consistency issues
+   - 8-9: Adequate annotations but readability or consistency problems, or minimal annotation
+   - 7: Poor readability, inconsistent, or annotations used more as personal sketches
+   - 6: Barely readable, minimal annotation, or annotations don't communicate problems effectively
+   
+   **Structure & Navigation (max 10 points):** Based on analysis of structural issues in the interface.
+
+3. Intro/Group Pages: Evaluate these components:
+   
+   **Professional Quality (max 10 points):** Visual organization, presentation, and layout quality.
+   
+   CRITICAL EVALUATION CRITERIA:
+   - **Background distraction**: Background could be distracting sometimes (not contributing to information and communication). Deduct points if background has:
+     * High color contrast that interferes with readability
+     * Meaningless icon decorations that don't support content
+     * Patterns or images that compete with text for attention
+   - **Layout organization**: Layout could be more organized. Deduct points for:
+     * Poor spacing between elements
+     * Lack of clear grid structure
+     * Misaligned elements
+     * Inconsistent margins or padding
+   - **Visual hierarchy**: Should use headings, color, spacing to create clear information hierarchy. Deduct points if hierarchy is unclear.
+   
+   Scoring guidance:
+   - 10: Well-organized layout, clear hierarchy, non-distracting background, consistent spacing and alignment
+   - 10: Good organization with minor spacing or alignment issues
+   - 8-9: Adequate layout but some organization problems or slightly distracting background
+   - 7: Poor spacing, misalignment, or distracting background elements
+   - 6: Very disorganized layout, highly distracting background, or major visual problems
+   
+   **Writing Quality (max 10 points):** Clarity, grammar, and structure of explanations.
+   
+   CRITICAL EVALUATION CRITERIA:
+   - **Grammar errors**: Deduct points for grammar errors, spelling mistakes, or unclear sentence structure.
+   - **Clarity**: Text should be clear and well-organized. Deduct points if explanations are confusing or poorly structured.
+   - **Professional tone**: Writing should be professional and appropriate for academic work. Deduct points for overly casual or unprofessional language.
+   
+   Scoring guidance:
+   - 10: Clear, well-written, no grammar errors, professional tone
+   - 9: Good writing with minor grammar issues or occasional unclear sentences
+   - 7-8: Adequate writing but some grammar errors or clarity issues
+   - 5-6: Multiple grammar errors, unclear explanations, or unprofessional tone
+   - 5: Many grammar errors, very unclear writing, or highly unprofessional
+   
+   **Group Integration (max 15 points):** ONLY evaluated here, not on heuristic pages. Explanation of group collaboration, how work fits together, and division of responsibilities.
+   
+   IMPORTANT: When evaluating Group Integration, consider using the rubric_relevance information from pages. If a page contains group integration content (page_role is "intro" or "group_collab"), check the rubric_relevance.group_integration field to help guide your scoring:
+   - If ANY page has rubric_relevance.group_integration = "high" → award full points (15)
+   - "med": Page mentions group collaboration but may lack detail → award moderate points (14)
+   - "low": Page has minimal group integration content → award lower points (13)
+   - "none": Page doesn't address group integration → award minimal or no points (12)
+   
+   Use the rubric_relevance.group_integration values from intro/group_collab pages to inform your scoring decision. If any page shows "high" relevance, give full marks (15 points).
+
+4. Overall Evaluation: Professional Quality and Writing Quality should also consider the entire submission holistically.
+
+5. Bonus Scores:
+   - Bonus AI Opportunities (max 3): Evaluate based on ai_opportunities_pages if provided. See detailed criteria below.
+   - Bonus Exceptional Quality (max 2): If work significantly exceeds expectations (typically only if overall_score_0_100 is high, 97+)
+
+You will receive a JSON object called "ScoringInput" describing all issues found in a student's submission. For each issue, you can see:
+- heuristic_id, title, combined_description
+- AI proposed severity and AI rubric scores (if present)
+- TA review overrides (final severity, per-component scores, comments), when available
+
+The ScoringInput may also include an optional "ai_opportunities_pages" array. This contains pages where students discuss how AI could help address the usability issues they found.
+
+Use the TA review when present as the primary truth.
+Use AI scores only to fill gaps when the TA did not review an issue.
+
+BONUS - AI OPPORTUNITIES (0-3 points):
+This is an optional bonus component. Some students include an "AI Opportunities" page describing how AI could help fix the problems they found on the Julian site.
+
+Scoring criteria:
+- 0 points: No meaningful AI discussion OR AI ideas are generic/unrelated to the actual usability issues. If no ai_opportunities_pages are provided, set to 0.
+- 1 point: Mentions AI in a somewhat relevant way, but ideas are shallow or only loosely tied to specific violations. Low relevance_to_violations or generic specificity.
+- 2 points: Reasonable, specific AI ideas clearly tied to some violations and user experience improvements. Medium to high relevance_to_violations, somewhat_specific to very_specific.
+- 3 points: Outstanding, well-motivated AI proposals tightly linked to the violations, realistic in terms of what AI can do, and clearly improve the user experience. High relevance_to_violations and very_specific specificity. Ideas should be concrete and plausible (e.g., "AI-driven skeleton screens for slow loading product pages", "AI-powered form validation", "adaptive filters based on user preferences").
+
+Use the ai_opportunities_pages array (if provided) to evaluate:
+- relevance_to_violations: How well the AI ideas connect to specific violations found
+- specificity: How concrete and plausible the AI proposals are
+- llm_summary and raw_text_excerpt: The actual content of the AI opportunities discussion
+
+If ai_opportunities_pages is not provided or is empty, set bonus_ai_opportunities to 0 points and explain that no bonus content was provided.
+Based on ALL issues and their scores, compute:
+
+- A final overall_score_0_100 (integer, 0-100, including bonus if applicable).
+- For each rubric component, return points (0 to max), max value, and explanation:
+  - coverage: {{"points": <0-15>, "max": 15, "explanation": "<1-2 sentences explaining why points were deducted or awarded>"}}
+  - violation_quality: {{"points": <0-20>, "max": 20, "explanation": "<1-2 sentences explaining why points were deducted or awarded>"}}
+  - severity_analysis: {{"points": <0-10>, "max": 10, "explanation": "<1-2 sentences explaining why points were deducted or awarded>"}}
+  - screenshots_evidence: {{"points": <0-10>, "max": 10, "explanation": "<1-2 sentences explaining why points were deducted or awarded>"}}
+  - structure_navigation: {{"points": <0-10>, "max": 10, "explanation": "<1-2 sentences explaining why points were deducted or awarded>"}}
+  - professional_quality: {{"points": <0-10>, "max": 10, "explanation": "<1-2 sentences explaining why points were deducted or awarded>"}}
+  - writing_quality: {{"points": <0-10>, "max": 10, "explanation": "<1-2 sentences explaining why points were deducted or awarded>"}}
+  - group_integration: {{"points": <0-15>, "max": 15, "explanation": "<1-2 sentences explaining why points were deducted or awarded>"}}
+- Optional bonus_scores (only if applicable):
+  - bonus_ai_opportunities: {{"points": <0-3>, "max": 3, "explanation": "<optional explanation>"}}
+  - bonus_exceptional_quality: {{"points": <0-1>, "max": 1, "explanation": "<optional explanation>"}}
+- A short summary_comment (2–4 sentences).
+
+IMPORTANT: For each rubric component, the explanation should clearly state:
+- If points were deducted, explain WHY (e.g., "Missing annotations on screenshots", "Insufficient coverage of heuristics", "Poor severity justification")
+- If full points were awarded, briefly explain WHY (e.g., "All 10 heuristics covered with detailed analysis", "Clear annotations on all screenshots")
+- Be specific and reference the actual issues/pages when explaining deductions.
+
+Return **ONLY** a valid JSON object matching this structure:
+{{
+  "overall_score_0_100": <integer 0-100>,
+  "rubric_scores": {{
+    "coverage": {{"points": <0-15>, "max": 15, "explanation": "<1-2 sentences>"}},
+    "violation_quality": {{"points": <0-20>, "max": 20, "explanation": "<1-2 sentences>"}},
+    "severity_analysis": {{"points": <0-10>, "max": 10, "explanation": "<1-2 sentences>"}},
+    "screenshots_evidence": {{"points": <0-10>, "max": 10, "explanation": "<1-2 sentences>"}},
+    "structure_navigation": {{"points": <0-10>, "max": 10, "explanation": "<1-2 sentences>"}},
+    "professional_quality": {{"points": <0-10>, "max": 10, "explanation": "<1-2 sentences>"}},
+    "writing_quality": {{"points": <0-10>, "max": 10, "explanation": "<1-2 sentences>"}},
+    "group_integration": {{"points": <0-15>, "max": 15, "explanation": "<1-2 sentences>"}}
+  }},
+  "bonus_scores": {{
+    "bonus_ai_opportunities": {{"points": <0-3>, "max": 3, "explanation": "<optional>"}},
+    "bonus_exceptional_quality": {{"points": <0-2>, "max": 2, "explanation": "<optional>"}}
+  }},
+  "summary_comment": "<2-4 sentences>",
+  "ai_vs_ta_notes": "<optional notes about differences>"
+}}
+
+Do not include any extra text or explanation outside the JSON object.
+
+The ScoringInput JSON contains:
+1. **Issues array**: Issue-level aggregated data (heuristic_id, title, combined_description, pages_involved, ai_proposed_severity, and optional TA review overrides)
+2. **Submission metadata**: Overall statistics (num_pages, num_issues, num_heuristics, page_roles distribution)
+3. **AI opportunities pages** (optional): Pages where students discuss how AI could help address UX issues
+
+Now here is the ScoringInput JSON:
+
+```json
+{json.dumps(scoring_input, indent=2)}
+```
+"""
+    
+    try:
+        generation_config = {
+            "temperature": 0.2,
+            "max_output_tokens": 16384,  # Increased significantly for detailed grading responses with explanations (prompt is ~6800 tokens)
+            "response_mime_type": "application/json",
+        }
+        
+        response = MODEL.generate_content(prompt, generation_config=generation_config)
+        
+        # Extract response text with detailed error diagnostics
+        response_text = None
+        error_details = []
+        
+        # Check for safety filters or blocked content first
+        if hasattr(response, 'prompt_feedback'):
+            if response.prompt_feedback:
+                if hasattr(response.prompt_feedback, 'block_reason'):
+                    if response.prompt_feedback.block_reason:
+                        error_details.append(f"Prompt blocked: {response.prompt_feedback.block_reason}")
+        
+        # Check candidates for finish reasons and safety ratings
+        max_tokens_detected = False
+        if response.candidates and len(response.candidates) > 0:
+            candidate = response.candidates[0]
+            if hasattr(candidate, 'finish_reason'):
+                finish_reason = candidate.finish_reason
+                if finish_reason and finish_reason != 1:  # 1 = STOP (normal)
+                    finish_reason_map = {
+                        0: "FINISH_REASON_UNSPECIFIED",
+                        2: "MAX_TOKENS",
+                        3: "SAFETY",
+                        4: "RECITATION",
+                        5: "OTHER"
+                    }
+                    reason = finish_reason_map.get(finish_reason, f"Unknown ({finish_reason})")
+                    error_details.append(f"Finish reason: {reason}")
+                    
+                    # Track MAX_TOKENS for special handling
+                    if finish_reason == 2:  # MAX_TOKENS
+                        max_tokens_detected = True
+            
+            # Check safety ratings
+            if hasattr(candidate, 'safety_ratings'):
+                if candidate.safety_ratings:
+                    blocked_categories = []
+                    for rating in candidate.safety_ratings:
+                        if hasattr(rating, 'blocked') and rating.blocked:
+                            category = getattr(rating, 'category', 'UNKNOWN')
+                            blocked_categories.append(str(category))
+                    if blocked_categories:
+                        error_details.append(f"Content blocked by safety filters: {', '.join(blocked_categories)}")
+        
+        # Method 1: Try response.text (standard method)
+        try:
+            response_text = response.text
+            # Even if MAX_TOKENS, we might have partial response
+            if max_tokens_detected and response_text and len(response_text.strip()) > 50:
+                print(f"[WARNING] Got partial response due to MAX_TOKENS (length: {len(response_text)})")
+        except (ValueError, AttributeError) as e:
+            error_details.append(f"Method 1 (response.text) failed: {type(e).__name__}: {str(e)}")
+        
+        # Method 2: If that fails, try to extract from candidates directly
+        if not response_text and response.candidates and len(response.candidates) > 0:
+            candidate = response.candidates[0]
+            try:
+                if hasattr(candidate, 'content') and candidate.content:
+                    if hasattr(candidate.content, 'parts') and candidate.content.parts:
+                        parts_text = []
+                        for part in candidate.content.parts:
+                            if hasattr(part, 'text') and part.text:
+                                parts_text.append(part.text)
+                        if parts_text:
+                            response_text = "".join(parts_text)
+                            if max_tokens_detected and response_text and len(response_text.strip()) > 50:
+                                print(f"[WARNING] Got partial response from candidates due to MAX_TOKENS (length: {len(response_text)})")
+            except Exception as e:
+                error_details.append(f"Method 2 (candidates.parts) failed: {type(e).__name__}: {str(e)}")
+        
+        # Method 3: Try to get any text from the response object
+        if not response_text:
+            try:
+                # Try accessing the response as a string
+                response_text = str(response)
+                # If it's just the object representation, try candidates again
+                if response_text.startswith('<') or 'object at' in response_text:
+                    response_text = None  # Reset if it's just object representation
+                    if response.candidates:
+                        for candidate in response.candidates:
+                            try:
+                                if hasattr(candidate, 'content'):
+                                    content_str = str(candidate.content)
+                                    if content_str and len(content_str) > 50 and not content_str.startswith('<'):
+                                        response_text = content_str
+                                        break
+                            except Exception:
+                                continue
+            except Exception as e:
+                error_details.append(f"Method 3 (str conversion) failed: {type(e).__name__}: {str(e)}")
+        
+        # If we still don't have text, create a meaningful error response
+        if not response_text or len(response_text.strip()) < 10:
+            error_msg = "Could not extract text from Gemini response"
+            if error_details:
+                error_msg += f". Details: {'; '.join(error_details)}"
+            else:
+                error_msg += ". Response structure may have changed or content was filtered."
+            
+            # Check if it's a MAX_TOKENS issue
+            if response.candidates and len(response.candidates) > 0:
+                candidate = response.candidates[0]
+                if hasattr(candidate, 'finish_reason'):
+                    finish_reason = candidate.finish_reason
+                    if finish_reason == 2:  # MAX_TOKENS
+                        error_msg = "Response was truncated due to MAX_TOKENS limit. The grading response exceeded 16384 tokens."
+                        # Try to get usage metadata if available
+                        if hasattr(response, 'usage_metadata'):
+                            usage = response.usage_metadata
+                            prompt_tokens = getattr(usage, 'prompt_token_count', None)
+                            total_tokens = getattr(usage, 'total_token_count', None)
+                            if prompt_tokens:
+                                error_msg += f" Prompt tokens: {prompt_tokens}"
+                            if total_tokens:
+                                error_msg += f" Total tokens: {total_tokens}"
+                        error_msg += " The response may be too complex. Consider reducing the number of issues or simplifying the prompt."
+            
+            print(f"[ERROR] Grading LLM: {error_msg}")
+            print(f"[DEBUG] Response object type: {type(response)}")
+            print(f"[DEBUG] Response has candidates: {hasattr(response, 'candidates') and response.candidates}")
+            if hasattr(response, 'candidates') and response.candidates:
+                print(f"[DEBUG] First candidate type: {type(response.candidates[0])}")
+                print(f"[DEBUG] First candidate finish_reason: {getattr(response.candidates[0], 'finish_reason', 'N/A')}")
+                if hasattr(response, 'usage_metadata'):
+                    usage = response.usage_metadata
+                    print(f"[DEBUG] Usage metadata: {usage}")
+            
+            raise ValueError(error_msg)
+        
+        return response_text
+    except ValueError as e:
+        # Re-raise ValueError with detailed message
+        print(f"[ERROR] Grading LLM ValueError: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to call LLM for grading: {str(e)}")
+    except Exception as e:
+        print(f"[ERROR] Error calling grading LLM: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Failed to call LLM for grading: {str(e)}")
+
+
+def parse_scoring_output(raw: str) -> Dict[str, Any]:
+    """Parse LLM JSON response into ScoringOutput and normalize structure."""
+    try:
+        # Clean up the response text - remove markdown code fences if present
+        cleaned_raw = raw.strip()
+        if cleaned_raw.startswith("```json"):
+            cleaned_raw = cleaned_raw[7:].strip()
+        if cleaned_raw.startswith("```"):
+            cleaned_raw = cleaned_raw[3:].strip()
+        if cleaned_raw.endswith("```"):
+            cleaned_raw = cleaned_raw[:-3].strip()
+        
+        # Try direct JSON parsing
+        output = json.loads(cleaned_raw)
+        
+        # Validate structure with detailed error messages
+        # Accept both 'overall_score_0_100' and 'total_score' as valid field names
+        if "overall_score_0_100" not in output and "total_score" not in output:
+            available_keys = list(output.keys()) if isinstance(output, dict) else "Not a dict"
+            error_msg = f"Missing 'overall_score_0_100' or 'total_score' in response. Available keys: {available_keys}"
+            print(f"[ERROR] Parse scoring output: {error_msg}")
+            print(f"[DEBUG] Response preview (first 500 chars): {cleaned_raw[:500]}")
+            raise ValueError(error_msg)
+        
+        # Normalize field name: if 'total_score' exists but 'overall_score_0_100' doesn't, use 'total_score'
+        if "overall_score_0_100" not in output and "total_score" in output:
+            output["overall_score_0_100"] = output["total_score"]
+            print(f"[INFO] Using 'total_score' ({output['total_score']}) as 'overall_score_0_100'")
+        if "rubric_scores" not in output:
+            available_keys = list(output.keys()) if isinstance(output, dict) else "Not a dict"
+            error_msg = f"Missing 'rubric_scores' in response. Available keys: {available_keys}"
+            print(f"[ERROR] Parse scoring output: {error_msg}")
+            print(f"[DEBUG] Response preview (first 500 chars): {cleaned_raw[:500]}")
+            raise ValueError(error_msg)
+        
+        # Normalize rubric_scores structure - ensure each has {points, max, explanation}
+        rubric_scores = output.get("rubric_scores", {})
+        max_points = {
+            "coverage": 15,
+            "violation_quality": 20,
+            "severity_analysis": 10,
+            "screenshots_evidence": 10,
+            "structure_navigation": 10,
+            "professional_quality": 10,
+            "writing_quality": 10,
+            "group_integration": 15,
+        }
+        
+        normalized_rubric = {}
+        for key, max_val in max_points.items():
+            if key in rubric_scores:
+                value = rubric_scores[key]
+                if isinstance(value, dict) and "points" in value:
+                    normalized_rubric[key] = {
+                        "points": value.get("points", 0),
+                        "max": value.get("max", max_val),
+                        "explanation": value.get("explanation", "No explanation provided.")
+                    }
+                elif isinstance(value, (int, float)):
+                    # Legacy format: just a number, convert to {points, max, explanation}
+                    normalized_rubric[key] = {
+                        "points": int(value),
+                        "max": max_val,
+                        "explanation": "No explanation provided."
+                    }
+                else:
+                    normalized_rubric[key] = {"points": 0, "max": max_val, "explanation": "No explanation provided."}
+            else:
+                normalized_rubric[key] = {"points": 0, "max": max_val, "explanation": "No explanation provided."}
+
+        # Enforce integer scores for all components except Screenshots & Evidence
+        # Only Screenshots & Evidence is allowed to have 0.5-style granular deductions.
+        for key, score in normalized_rubric.items():
+            if key != "screenshots_evidence":
+                try:
+                    score_points = float(score.get("points", 0))
+                    score["points"] = int(round(score_points))
+                except (TypeError, ValueError):
+                    # If parsing fails, fall back to 0 to avoid breaking the pipeline
+                    score["points"] = int(score.get("points", 0) or 0)
+
+        output["rubric_scores"] = normalized_rubric
+        
+        # Normalize bonus_scores if present
+        if "bonus_scores" in output:
+            bonus_scores = output["bonus_scores"]
+            bonus_max = {
+                "bonus_ai_opportunities": 3,
+                "bonus_exceptional_quality": 2,
+            }
+            normalized_bonus = {}
+            for key, max_val in bonus_max.items():
+                if key in bonus_scores:
+                    value = bonus_scores[key]
+                    if isinstance(value, dict) and "points" in value:
+                        normalized_bonus[key] = {
+                            "points": value.get("points", 0),
+                            "max": value.get("max", max_val),
+                            "explanation": value.get("explanation", "")
+                        }
+                    elif isinstance(value, (int, float)):
+                        normalized_bonus[key] = {
+                            "points": int(value),
+                            "max": max_val,
+                            "explanation": ""
+                        }
+                    else:
+                        normalized_bonus[key] = {"points": 0, "max": max_val, "explanation": ""}
+                else:
+                    normalized_bonus[key] = {"points": 0, "max": max_val, "explanation": ""}
+            output["bonus_scores"] = normalized_bonus
+        
+        return output
+    except json.JSONDecodeError as e:
+        # Try to extract JSON from markdown code blocks
+        import re
+        json_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', raw, re.DOTALL)
+        if json_match:
+            try:
+                output = json.loads(json_match.group(1))
+                # Re-validate after extraction
+                if "overall_score_0_100" not in output:
+                    raise ValueError(f"Missing 'overall_score_0_100' in extracted JSON. Available keys: {list(output.keys()) if isinstance(output, dict) else 'Not a dict'}")
+                if "rubric_scores" not in output:
+                    raise ValueError(f"Missing 'rubric_scores' in extracted JSON. Available keys: {list(output.keys()) if isinstance(output, dict) else 'Not a dict'}")
+                # Continue with normalization if extraction succeeded
+                # (normalization code continues below)
+            except (json.JSONDecodeError, ValueError) as e2:
+                print(f"[ERROR] Failed to parse JSON even after extracting from code block: {e2}")
+                print(f"[DEBUG] Raw response (first 1000 chars): {raw[:1000]}")
+                raise ValueError(f"Could not parse JSON from LLM response: {str(e2)}")
+        else:
+            print(f"[ERROR] JSON decode error: {e}")
+            print(f"[DEBUG] Raw response (first 1000 chars): {raw[:1000]}")
+            raise ValueError(f"Could not parse JSON from LLM response: {str(e)}")
+        # Try to extract JSON from markdown code blocks
+        json_block_match = re.search(r'```(?:json)?\s*(\{.*?)\s*```', raw, re.DOTALL)
+        if json_block_match:
+            json_str = json_block_match.group(1)
+            try:
+                return json.loads(json_str)
+            except json.JSONDecodeError:
+                pass
+        
+        # Try to find JSON object directly
+        json_start = raw.find('{')
+        if json_start != -1:
+            json_str = raw[json_start:]
+            try:
+                return json.loads(json_str)
+            except json.JSONDecodeError:
+                pass
+        
+        # Provide detailed error information
+        error_msg = f"Could not parse JSON from LLM response: {str(e)}"
+        
+        # Include first 500 chars of raw response for debugging
+        raw_preview = raw[:500] if raw else "(empty response)"
+        error_msg += f"\n\nRaw response preview (first 500 chars):\n{raw_preview}"
+        
+        # Check if response is empty
+        if not raw or len(raw.strip()) == 0:
+            error_msg += "\n\nERROR: Response is completely empty. This may indicate the LLM did not generate any output."
+        
+        # Check if response looks like HTML or error message
+        if raw and ("<html" in raw.lower() or "<!doctype" in raw.lower()):
+            error_msg += "\n\nERROR: Response appears to be HTML instead of JSON. This may indicate an API error."
+        
+        # Log the full response for debugging (truncated to 2000 chars)
+        print(f"[ERROR] Full LLM response (truncated to 2000 chars):\n{raw[:2000]}")
+        
+        raise ValueError(error_msg)
+
+
+def save_job_scoring(job_id: str, scoring_output: Dict[str, Any]) -> None:
+    """Save scoring output to disk."""
+    scoring_file = PAGES_ISSUES_DIR / f"{job_id}_scoring.json"
+    data = {
+        "job_id": job_id,
+        "scoring": scoring_output,
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
+    }
+    with open(scoring_file, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+def compare_scoring_changes(old_scoring: Dict[str, Any], new_scoring: Dict[str, Any]) -> Dict[str, Any]:
+    """Compare old and new scoring outputs and generate a summary of changes."""
+    changes = {
+        "overall_score_change": None,
+        "component_changes": [],
+        "bonus_changes": [],
+    }
+    
+    # Compare overall score
+    old_overall = old_scoring.get("overall_score_0_100", 0)
+    new_overall = new_scoring.get("overall_score_0_100", 0)
+    if old_overall != new_overall:
+        changes["overall_score_change"] = {
+            "old": old_overall,
+            "new": new_overall,
+            "delta": new_overall - old_overall,
+        }
+    
+    # Compare rubric scores
+    old_rubric = old_scoring.get("rubric_scores", {})
+    new_rubric = new_scoring.get("rubric_scores", {})
+    
+    for key in set(list(old_rubric.keys()) + list(new_rubric.keys())):
+        old_score = old_rubric.get(key, {})
+        new_score = new_rubric.get(key, {})
+        
+        old_points = old_score.get("points", 0) if isinstance(old_score, dict) else old_score
+        new_points = new_score.get("points", 0) if isinstance(new_score, dict) else new_score
+        
+        if old_points != new_points:
+            changes["component_changes"].append({
+                "component": key,
+                "old": old_points,
+                "new": new_points,
+                "delta": new_points - old_points,
+            })
+    
+    # Compare bonus scores
+    old_bonus = old_scoring.get("bonus_scores", {})
+    new_bonus = new_scoring.get("bonus_scores", {})
+    
+    for key in set(list(old_bonus.keys()) + list(new_bonus.keys())):
+        old_score = old_bonus.get(key, {})
+        new_score = new_bonus.get(key, {})
+        
+        old_points = old_score.get("points", 0) if isinstance(old_score, dict) else old_score
+        new_points = new_score.get("points", 0) if isinstance(new_score, dict) else new_score
+        
+        if old_points != new_points:
+            changes["bonus_changes"].append({
+                "component": key,
+                "old": old_points,
+                "new": new_points,
+                "delta": new_points - old_points,
+            })
+    
+    return changes
+
+
+async def generate_improved_prompt_from_reviews(
+    job_id: str,
+    old_scoring: Dict[str, Any],
+    new_scoring: Dict[str, Any],
+    issues: List[Dict[str, Any]]
+) -> Optional[Dict[str, Any]]:
+    """Analyze TA feedback and generate small, targeted improvements to the grading prompt."""
+    if not MODEL:
+        return None
+    
+    # Collect TA review comments from issues
+    ta_feedback = []
+    for issue in issues:
+        if issue.get("ta_review"):
+            ta_review = issue["ta_review"]
+            feedback_item = {
+                "issue_id": issue.get("issue_id", ""),
+                "heuristic_id": issue.get("heuristic_id", ""),
+                "title": issue.get("title", ""),
+            }
+            if ta_review.get("override_reason"):
+                feedback_item["override_reason"] = ta_review["override_reason"]
+            if ta_review.get("ta_comment"):
+                feedback_item["ta_comment"] = ta_review["ta_comment"]
+            if feedback_item.get("override_reason") or feedback_item.get("ta_comment"):
+                ta_feedback.append(feedback_item)
+    
+    # Load rubric component comments
+    rubric_comments = {}
+    rubric_comments_file = PAGES_ISSUES_DIR / f"{job_id}_rubric_comments.json"
+    if rubric_comments_file.exists():
+        try:
+            with open(rubric_comments_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                rubric_comments = data.get("comments", {})
+        except Exception as e:
+            print(f"[WARN] Could not load rubric comments: {e}")
+    
+    # Calculate changes
+    overall_change = new_scoring.get('overall_score_0_100', 0) - old_scoring.get('overall_score_0_100', 0)
+    
+    # Build prompt for LLM to analyze issues and suggest small improvements
+    ta_feedback_text = ""
+    if ta_feedback:
+        ta_feedback_text = "\n\nTA REVIEW FEEDBACK FROM ISSUES:\n"
+        for i, feedback in enumerate(ta_feedback, 1):
+            ta_feedback_text += f"\n{i}. {feedback.get('heuristic_id')} - {feedback.get('title', 'N/A')}:\n"
+            if feedback.get("override_reason"):
+                ta_feedback_text += f"   Override Reason: {feedback['override_reason']}\n"
+            if feedback.get("ta_comment"):
+                ta_feedback_text += f"   TA Comment: {feedback['ta_comment']}\n"
+    else:
+        ta_feedback_text = "\n\nTA REVIEW FEEDBACK: No TA reviews found on individual issues.\n"
+    
+    rubric_comments_text = ""
+    if rubric_comments:
+        rubric_comments_text = "\n\nTA RUBRIC COMPONENT COMMENTS:\n"
+        for component, comment in rubric_comments.items():
+            if comment and comment.strip():
+                rubric_comments_text += f"- {component}: {comment}\n"
+    else:
+        rubric_comments_text = "\n\nTA RUBRIC COMPONENT COMMENTS: No rubric component comments found.\n"
+    
+    # Load current grading prompt
+    # Use the same path as defined in the file
+    grading_prompt_path = Path(__file__).parent.parent / "output_static" / "grading_prompt.txt"
+    current_prompt = ""
+    if grading_prompt_path.exists():
+        try:
+            with open(grading_prompt_path, "r", encoding="utf-8") as f:
+                current_prompt = f.read().strip()
+        except Exception as e:
+            print(f"[WARNING] Failed to load grading_prompt.txt: {e}")
+            current_prompt = ""
+    
+    prompt = f"""You are analyzing TA feedback to identify what needs to be improved in the grading prompt.
+
+CONTEXT:
+- Old score (with TA reviews): {old_scoring.get('overall_score_0_100', 0)}/100
+- New score (after clearing TA reviews): {new_scoring.get('overall_score_0_100', 0)}/100
+- Score change: {overall_change:+d} points
+{ta_feedback_text}
+{rubric_comments_text}
+
+OLD SCORING DETAILS:
+{json.dumps(old_scoring, indent=2)}
+
+NEW SCORING DETAILS:
+{json.dumps(new_scoring, indent=2)}
+
+CURRENT GRADING PROMPT:
+{current_prompt}
+
+Your task:
+1. Analyze the TA feedback (override reasons, TA comments, and rubric component comments) to understand what the TA found wrong or missing in the AI's grading.
+2. Summarize the key problems: What patterns do you see in how the AI's grading differs from TA expectations based on their actual feedback?
+3. Suggest MINOR, targeted improvements: Provide 2-4 small, specific changes to the grading prompt that would better align AI grading with TA expectations, based on the actual TA feedback provided above.
+4. DO NOT rewrite the entire prompt. Only suggest small, focused modifications to specific sections.
+5. Focus on the specific issues mentioned in the TA feedback.
+6. After providing suggestions, APPLY these improvements to the current prompt and return the FULL MODIFIED PROMPT.
+
+Return a JSON object with this structure:
+{{
+  "problems_summary": "1-2 sentences summarizing the main issues based on TA feedback",
+  "suggested_improvements": [
+    {{
+      "section": "Which section of the prompt (e.g., 'Section 3.2 Violation Quality', 'Section 3.3 Severity Analysis')",
+      "current_text": "The exact current text that needs modification (quote 2-4 lines from the prompt)",
+      "suggested_change": "The exact replacement text (1-3 sentences, minimal change)",
+      "rationale": "Why this change would help based on TA feedback (1 sentence)"
+    }}
+  ],
+  "modified_prompt": "The FULL grading prompt with all suggested improvements applied. This must be the complete, valid prompt that can be saved directly to grading_prompt.txt. Make MINIMAL changes - only modify the specific sections mentioned in suggested_improvements, keeping everything else exactly the same."
+}}
+
+CRITICAL REQUIREMENTS FOR modified_prompt:
+- Keep ALL sections intact (Section 0, 1, 2, 3, 3B, 4, 5, 6)
+- Only modify the specific wording in the sections mentioned in suggested_improvements
+- Do NOT change the structure, format, or any other content
+- Do NOT change ScoringInput or ScoringOutput logic
+- The modified_prompt must be ready to save directly to grading_prompt.txt
+
+Return ONLY valid JSON, no markdown, no explanation outside the JSON.
+"""
+    
+    try:
+        response = MODEL.generate_content(prompt)
+        response_text = response.text.strip()
+        
+        # Clean up markdown if present
+        if response_text.startswith("```json"):
+            response_text = response_text[7:].strip()
+        if response_text.startswith("```"):
+            response_text = response_text[3:].strip()
+        if response_text.endswith("```"):
+            response_text = response_text[:-3].strip()
+        
+        analysis = json.loads(response_text)
+        
+        # Save analysis to a file
+        analysis_file = PAGES_ISSUES_DIR / f"{job_id}_prompt_improvement_analysis.json"
+        with open(analysis_file, "w", encoding="utf-8") as f:
+            json.dump(analysis, f, indent=2, ensure_ascii=False)
+        
+        return analysis
+    except Exception as e:
+        print(f"[ERROR] Failed to generate prompt improvement analysis: {e}")
+        return None
+
+
+async def generate_prompt_from_comments(job_id: str) -> Dict[str, Any]:
+    """Generate descriptive analysis and prompt draft from TA rubric component comments."""
+    if not MODEL:
+        raise HTTPException(status_code=500, detail="LLM model not available")
+
+    rubric_comments_file = PAGES_ISSUES_DIR / f"{job_id}_rubric_comments.json"
+    if not rubric_comments_file.exists():
+        raise HTTPException(status_code=404, detail="No rubric component comments found for this job.")
+
+    try:
+        with open(rubric_comments_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            rubric_comments = data.get("comments", {})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to load rubric comments: {str(e)}")
+
+    if not rubric_comments:
+        raise HTTPException(status_code=404, detail="Rubric component comments file is empty.")
+
+    grading_prompt_path = Path(__file__).parent.parent / "output_static" / "grading_prompt.txt"
+    current_prompt = ""
+    if grading_prompt_path.exists():
+        try:
+            with open(grading_prompt_path, "r", encoding="utf-8") as f:
+                current_prompt = f.read().strip()
+        except Exception as e:
+            print(f"[WARNING] Failed to load grading_prompt.txt: {e}")
+            current_prompt = ""
+
+    summary_prompt = f"""You are assisting a TA in refining an autograder prompt.
+
+CURRENT PROMPT:
+\"\"\"PROMPT_START
+{current_prompt}
+PROMPT_END\"\"\"
+
+TA RUBRIC COMMENTS (JSON):
+{json.dumps(rubric_comments, indent=2)}
+
+TASK:
+1. Summarize, in 2–3 sentences, what these TA comments are asking for (focus on rubric components and tone/expectations).
+2. Provide 2–4 actionable recommendations describing how the grading prompt should change.
+3. Apply those recommendations to the CURRENT PROMPT (between PROMPT_START and PROMPT_END) and return the full revised prompt with MINIMAL edits.
+4. Do NOT change the ScoringInput or ScoringOutput JSON schemas, and do NOT add/remove/rename ANY keys. Treat all JSON field names and structures in the prompt as a fixed API contract that must stay exactly the same.
+5. Keep the overall section structure, headings, and numbering identical. Prefer local wording tweaks, clarification sentences, or short insertions rather than large rewrites. Preserve the majority of the existing text and organization.
+
+OUTPUT (valid JSON only):
+{{
+  "analysis_summary": "Descriptive overview in plain English",
+  "recommendations": ["Short recommendation bullet", "..."],
+  "modified_prompt": "FULL prompt text after applying the minimal changes"
+}}
+"""
+
+    try:
+        generation_config = {
+            "temperature": 0.3,
+            "max_output_tokens": 8192,
+            "response_mime_type": "application/json",
+        }
+        response = MODEL.generate_content(summary_prompt, generation_config=generation_config)
+        response_text = response.text.strip()
+
+        # Clean up potential markdown fences
+        if response_text.startswith("```json"):
+            response_text = response_text[7:].strip()
+        if response_text.startswith("```"):
+            response_text = response_text[3:].strip()
+        if response_text.endswith("```"):
+            response_text = response_text[:-3].strip()
+
+        try:
+            # 首先嚴格嘗試解析整個回應
+            analysis = json.loads(response_text)
+        except json.JSONDecodeError:
+            # 第二層：從回應中抽出第一個 JSON 物件片段再嘗試解析
+            start = response_text.find("{")
+            end = response_text.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                json_fragment = response_text[start : end + 1]
+                try:
+                    analysis = json.loads(json_fragment)
+                except json.JSONDecodeError:
+                    # 仍然失敗時，嘗試手動提取 analysis_summary / recommendations
+                    preview = response_text[:2000]
+                    # 尝试直接从文本中提取 analysis_summary 和 recommendations 段落
+                    summary_match = re.search(r'"analysis_summary"\s*:\s*"([^"]*)"', response_text, re.DOTALL)
+                    rec_block_match = re.search(r'"recommendations"\s*:\s*\[(.*?)\]', response_text, re.DOTALL)
+                    summary_text = summary_match.group(1).strip() if summary_match else None
+                    recs: List[str] = []
+                    if rec_block_match:
+                        rec_block = rec_block_match.group(1)
+                        for m in re.finditer(r'"([^"]+)"', rec_block):
+                            rec = m.group(1).strip()
+                            if rec:
+                                recs.append(rec)
+                    if summary_text or recs:
+                        return {
+                            "analysis_summary": summary_text or "LLM returned non-strict JSON. Showing raw text instead:\n\n" + preview,
+                            "recommendations": recs,
+                            "modified_prompt": current_prompt,
+                        }
+                    return {
+                        "analysis_summary": "LLM returned non-strict JSON. Showing raw text instead:\n\n" + preview,
+                        "recommendations": [],
+                        "modified_prompt": current_prompt,
+                    }
+            # 完全找不到 JSON 結構，只能回傳原文
+            preview = response_text[:2000]
+            return {
+                "analysis_summary": "LLM returned non-strict JSON. Showing raw text instead:\n\n" + preview,
+                "recommendations": [],
+                "modified_prompt": current_prompt,
+            }
+
+        analysis.setdefault("analysis_summary", "No summary provided.")
+        analysis.setdefault("recommendations", [])
+        analysis.setdefault("modified_prompt", current_prompt)
+        return analysis
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to generate prompt analysis: {str(e)}")
+
+
+async def recompute_job_scores(job_id: str, clear_reviews: bool = True) -> Dict[str, Any]:
+    """Recompute final scores using LLM based on pages and issues."""
+    # 1. Load pages.json and issues.json
+    pages = load_pages_for_job(job_id)
+    issues = load_issues_for_job(job_id)
+    
+    print(f"[DEBUG] Loading data for job {job_id}: {len(pages)} pages, {len(issues)} issues")
+    
+    if not pages:
+        error_msg = f"No pages found for job {job_id}. Please run analysis first."
+        print(f"[ERROR] {error_msg}")
+        raise HTTPException(status_code=404, detail=error_msg)
+    if not issues:
+        error_msg = f"No issues found for job {job_id}. Please run analysis first."
+        print(f"[ERROR] {error_msg}")
+        raise HTTPException(status_code=404, detail=error_msg)
+    
+    # Load old scoring output for comparison
+    old_scoring = None
+    scoring_file = PAGES_ISSUES_DIR / f"{job_id}_scoring.json"
+    if scoring_file.exists():
+        try:
+            with open(scoring_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                old_scoring = data.get("scoring", {})
+        except Exception as e:
+            print(f"[WARNING] Could not load old scoring for comparison: {e}")
+    
+    # Clear TA reviews if requested
+    if clear_reviews:
+        print(f"[DEBUG] Clearing TA reviews for job {job_id}")
+        issues_file = PAGES_ISSUES_DIR / f"{job_id}_issues.json"
+        if issues_file.exists():
+            try:
+                with open(issues_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    issues_data = data.get("issues", [])
+                
+                # Clear ta_review from all issues
+                for issue in issues_data:
+                    if "ta_review" in issue:
+                        del issue["ta_review"]
+                
+                # Save back
+                with open(issues_file, "w", encoding="utf-8") as f:
+                    json.dump({"issues": issues_data}, f, indent=2, ensure_ascii=False)
+                
+                # Reload issues after clearing
+                issues = load_issues_for_job(job_id)
+                print(f"[DEBUG] Cleared TA reviews from {len(issues_data)} issues")
+            except Exception as e:
+                print(f"[WARNING] Could not clear TA reviews: {e}")
+    
+    # 2. Build ScoringInput
+    scoring_input = build_scoring_input(job_id, pages, issues)
+    
+    # 3. Call LLM
+    llm_response = await call_grading_llm(scoring_input)
+    
+    # 4. Parse response
+    scoring_output = parse_scoring_output(llm_response)
+    
+    # 5. Compare with old scoring and generate change summary
+    changes_summary = compare_scoring_changes(old_scoring, scoring_output) if old_scoring else None
+    
+    # 6. Analyze TA feedback and generate improvement suggestions (if any were cleared)
+    improvement_analysis = None
+    if clear_reviews and old_scoring:
+        try:
+            improvement_analysis = await generate_improved_prompt_from_reviews(job_id, old_scoring, scoring_output, issues)
+        except Exception as e:
+            print(f"[WARNING] Could not generate improvement analysis: {e}")
+    
+    # 7. Save to disk
+    save_job_scoring(job_id, scoring_output)
+    
+    return {
+        "scoring": scoring_output,
+        "changes": changes_summary,
+        "improvement_analysis": improvement_analysis,
+    }
+
+
+@app.post("/api/jobs/{jobId}/review/recompute")
+async def recompute_scores_endpoint(jobId: str, request: Dict[str, Any] = Body(default={})) -> Dict[str, Any]:
+    """Recompute final scores using LLM."""
+    print(f"[DEBUG] Received recompute request for jobId: {jobId}")
+    clear_reviews = request.get("clear_reviews", True)  # Default to clearing reviews
+    
+    try:
+        result = await recompute_job_scores(jobId, clear_reviews=clear_reviews)
+        print(f"[DEBUG] Successfully computed scores for jobId: {jobId}")
+        return {
+            "ok": True,
+            "scoring": result["scoring"],
+            "changes": result.get("changes"),
+            "improvement_analysis": result.get("improvement_analysis"),
+        }
+    except HTTPException as e:
+        print(f"[ERROR] HTTPException in recompute: {e.status_code} - {e.detail}")
+        raise
+    except Exception as err:
+        print(f"[ERROR] Error recomputing scores: {type(err).__name__}: {str(err)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Failed to recompute scores: {str(err)}")
+
+
+@app.post("/api/jobs/{jobId}/comment-prompt-analysis")
+async def comment_prompt_analysis(jobId: str) -> Dict[str, Any]:
+    """Combine TA rubric comments with the current prompt to produce an annotated draft before re-running grading."""
+    analysis = await generate_prompt_from_comments(jobId)
+    return {
+        "ok": True,
+        "analysis": analysis,
+    }
+
+
+@app.post("/api/apply-prompt-improvements")
+async def apply_prompt_improvements(request: Dict[str, Any]) -> Dict[str, Any]:
+    """Apply suggested improvements to the grading prompt."""
+    improvements = request.get("improvements", [])
+    if not improvements:
+        raise HTTPException(status_code=400, detail="No improvements provided")
+    
+    try:
+        # Load current prompt
+        current_prompt = get_current_prompt()
+        
+        # Apply improvements (for now, just save the current prompt with a note)
+        # In the future, we could implement automatic text replacement
+        # For now, we'll just save the improvements analysis and let the user manually update
+        
+        # Save improvements to a file for reference
+        improvements_file = PAGES_ISSUES_DIR / "prompt_improvements_log.json"
+        improvements_data = []
+        if improvements_file.exists():
+            try:
+                with open(improvements_file, "r", encoding="utf-8") as f:
+                    improvements_data = json.load(f)
+            except:
+                pass
+        
+        improvements_data.append({
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
+            "improvements": improvements,
+        })
+        
+        with open(improvements_file, "w", encoding="utf-8") as f:
+            json.dump(improvements_data, f, indent=2, ensure_ascii=False)
+        
+        improvements_file_path = str(improvements_file.relative_to(Path(__file__).parent.parent))
+        
+        return {
+            "ok": True,
+            "message": "Improvements logged. Please manually update grading_prompt.txt based on the suggestions.",
+            "saved_to": improvements_file_path,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to apply improvements: {str(e)}")
+
+
+@app.post("/api/update-grading-prompt")
+async def update_grading_prompt(request: Dict[str, Any]) -> Dict[str, Any]:
+    """Update the grading prompt file with a new version."""
+    new_prompt = request.get("prompt", "")
+    if not new_prompt:
+        raise HTTPException(status_code=400, detail="Prompt is required")
+    
+    try:
+        success = save_prompt_to_backend(new_prompt)
+        if success:
+            return {"ok": True, "message": "Grading prompt updated successfully"}
+        else:
+            raise HTTPException(status_code=500, detail="Failed to save prompt")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to update prompt: {str(e)}")
+
+
+@app.get("/api/jobs/{jobId}/scoring")
+async def get_scoring_output(jobId: str) -> Dict[str, Any]:
+    """Get saved scoring output for a job."""
+    scoring_file = PAGES_ISSUES_DIR / f"{jobId}_scoring.json"
+    if scoring_file.exists():
+        try:
+            with open(scoring_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return {"ok": True, "scoring": data.get("scoring", {})}
+        except Exception as e:
+            print(f"Error loading scoring output: {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to load scoring output: {str(e)}")
+    else:
+        raise HTTPException(status_code=404, detail="Scoring output not found. Please run recompute first.")
+
+
+@app.get("/api/jobs/{jobId}/rubric-comments")
+async def get_rubric_comments(jobId: str) -> Dict[str, Any]:
+    """Get saved rubric component comments for a job."""
+    comments_file = PAGES_ISSUES_DIR / f"{jobId}_rubric_comments.json"
+    if comments_file.exists():
+        try:
+            with open(comments_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return {"ok": True, "comments": data.get("comments", {})}
+        except Exception as e:
+            print(f"Error loading rubric comments: {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to load rubric comments: {str(e)}")
+    else:
+        raise HTTPException(status_code=404, detail="Rubric comments not found.")
+
+
+@app.delete("/api/jobs/{jobId}/scoring/summary-comment")
+async def delete_summary_comment(jobId: str) -> Dict[str, Any]:
+    """Delete the summary comment from scoring output."""
+    scoring_file = PAGES_ISSUES_DIR / f"{jobId}_scoring.json"
+    if scoring_file.exists():
+        try:
+            with open(scoring_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            
+            # Clear summary_comment
+            if "scoring" in data:
+                data["scoring"]["summary_comment"] = ""
+            
+            # Save back
+            with open(scoring_file, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            
+            return {"ok": True, "message": "Summary comment deleted successfully"}
+        except Exception as e:
+            print(f"Error deleting summary comment: {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to delete summary comment: {str(e)}")
+    else:
+        raise HTTPException(status_code=404, detail="Scoring output not found.")
+
+
+@app.post("/api/jobs/{jobId}/rubric-comments")
+async def save_rubric_comments(jobId: str, request: Dict[str, Any] = Body(default={})) -> Dict[str, Any]:
+    """Save rubric component comments for a job."""
+    comments = request.get("comments", {})
+    comments_file = PAGES_ISSUES_DIR / f"{jobId}_rubric_comments.json"
+    
+    try:
+        with open(comments_file, "w", encoding="utf-8") as f:
+            json.dump({"job_id": jobId, "comments": comments}, f, indent=2, ensure_ascii=False)
+        return {"ok": True, "message": "Rubric comments saved successfully"}
+    except Exception as e:
+        print(f"Error saving rubric comments: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to save rubric comments: {str(e)}")
+
+
+@app.post("/api/save-issue-scores")
+async def save_issue_scores(request: Dict[str, Any]) -> Dict[str, Any]:
+    """Save TA-modified scores for a specific issue."""
+    job_id = request.get("jobId")
+    issue_id = request.get("issueId")
+    scores = request.get("scores")
+    
+    if not job_id or not issue_id or not scores:
+        raise HTTPException(status_code=400, detail="jobId, issueId, and scores are required")
+    
+    issue_scores_file = PAGES_ISSUES_DIR / f"{job_id}_issue_scores.json"
+    
+    # Load existing issue scores
+    issue_scores_data = {}
+    if issue_scores_file.exists():
+        try:
+            with open(issue_scores_file, "r", encoding="utf-8") as f:
+                issue_scores_data = json.load(f)
+        except Exception as e:
+            print(f"Error loading issue scores: {e}")
+    
+    # Update scores for this issue
+    if "issues" not in issue_scores_data:
+        issue_scores_data["issues"] = {}
+    issue_scores_data["issues"][issue_id] = scores
+    issue_scores_data["lastUpdated"] = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+    
+    try:
+        with open(issue_scores_file, "w", encoding="utf-8") as f:
+            json.dump(issue_scores_data, f, indent=2, ensure_ascii=False)
+        
+        return {
+            "status": "success",
+            "jobId": job_id,
+            "issueId": issue_id,
+            "scores": scores,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error saving issue scores: {str(e)}")
+
+
+@app.get("/api/jobs/{jobId}/issue-scores")
+async def get_issue_scores(jobId: str) -> Dict[str, Any]:
+    """Get saved issue scores for a job."""
+    issue_scores_file = PAGES_ISSUES_DIR / f"{jobId}_issue_scores.json"
+    if issue_scores_file.exists():
+        try:
+            with open(issue_scores_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return {"ok": True, "issues": data.get("issues", {})}
+        except Exception as e:
+            print(f"Error loading issue scores: {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to load issue scores: {str(e)}")
+    else:
+        return {"ok": True, "issues": {}}
+
+
+@app.post("/api/save-grading-scores")
+async def save_grading_scores(request: Dict[str, Any]) -> Dict[str, Any]:
+    """Save TA-modified grading scores."""
+    job_id = request.get("jobId")
+    scores = request.get("scores")
+    
+    if not job_id or not scores:
+        raise HTTPException(status_code=400, detail="jobId and scores are required")
+    
+    scores_file = PAGES_ISSUES_DIR / f"{job_id}_scores.json"
+    
+    try:
+        with open(scores_file, "w", encoding="utf-8") as f:
+            json.dump({"scores": scores, "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())}, f, indent=2, ensure_ascii=False)
+        
+        return {
+            "status": "success",
+            "jobId": job_id,
+            "scores": scores,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error saving scores: {str(e)}")
+
+
+@app.patch("/api/update-page-review")
+async def update_page_review(jobId: str, pageId: str, request: Dict[str, Any]) -> Dict[str, Any]:
+    """Update TA review for a specific page."""
+    if not jobId or not pageId:
+        raise HTTPException(status_code=400, detail="jobId and pageId are required")
+    
+    ta_review = {
+        "override_reason": request.get("override_reason"),
+        "ta_comment": request.get("ta_comment"),
+    }
+    
+    pages_file = PAGES_ISSUES_DIR / f"{jobId}_pages.json"
+    
+    if not pages_file.exists():
+        raise HTTPException(status_code=404, detail="Pages file not found. Please run analysis first.")
+    
+    try:
+        with open(pages_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            # Handle both formats: {"pages": [...]} and [...]
+            if isinstance(data, list):
+                pages = data
+            elif isinstance(data, dict):
+                pages = data.get("pages", [])
+            else:
+                pages = []
+        
+        if not pages:
+            raise HTTPException(status_code=404, detail="No pages found in pages.json")
+        
+        # Find and update the page
+        page_found = False
+        for page in pages:
+            if page.get("page_id") == pageId:
+                page["ta_review"] = ta_review
+                page_found = True
+                break
+        
+        if not page_found:
+            # Log available page_ids for debugging
+            available_page_ids = [p.get("page_id", "N/A") for p in pages[:5]]
+            print(f"[DEBUG] Page {pageId} not found. Available page_ids (first 5): {available_page_ids}")
+            raise HTTPException(status_code=404, detail=f"Page {pageId} not found. Available pages: {len(pages)}")
+        
+        # Save back - use the same format as get_pages (direct array)
+        with open(pages_file, "w", encoding="utf-8") as f:
+            json.dump(pages, f, indent=2, ensure_ascii=False)
+        
+        return {
+            "status": "success",
+            "jobId": jobId,
+            "pageId": pageId,
+            "ta_review": ta_review,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[ERROR] Error updating page review: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Error updating page review: {str(e)}")
+
+
+@app.get("/api/get-pages")
+async def get_pages(jobId: str = Query(..., description="Job ID to get pages for")) -> Dict[str, Any]:
+    """Get all PageAnalysis objects for a job ID."""
+    print(f"[DEBUG] get_pages called with jobId: {jobId}")
+    pages_file = PAGES_ISSUES_DIR / f"{jobId}_pages.json"
+    
+    if pages_file.exists():
+        try:
+            with open(pages_file, "r", encoding="utf-8") as f:
+                pages_data = json.load(f)
+                # Handle both list and dict formats
+                if isinstance(pages_data, list):
+                    return {"jobId": jobId, "pages": pages_data}
+                elif isinstance(pages_data, dict):
+                    return {"jobId": jobId, "pages": pages_data.get("pages", [])}
+                return {"jobId": jobId, "pages": pages_data}
+        except Exception as e:
+            print(f"Error loading pages: {e}")
+    
+    # If pages.json doesn't exist, try to generate it from analysis results
+    # This handles the case where user jumps to reviewer mode before get-analysis-results is called
+    try:
+        results = []
+        # Load all analysis files for this job
+        for analysis_file in ANALYSIS_OUTPUT_DIR.glob(f"{jobId}_page_*.json"):
+            try:
+                with open(analysis_file, "r", encoding="utf-8") as f:
+                    result = json.load(f)
+                    results.append(result)
+            except Exception as e:
+                print(f"Error loading {analysis_file}: {e}")
+        
+        if results:
+            # Sort by page number
+            results.sort(key=lambda x: x.get("page_number", 0))
+            
+            # Extract structured_analysis from results
+            pages_data = []
+            for result in results:
+                structured = result.get("structured_analysis")
+                if structured:
+                    pages_data.append(structured)
+            
+            if pages_data:
+                # Save pages.json
+                pages_file = PAGES_ISSUES_DIR / f"{jobId}_pages.json"
+                with open(pages_file, "w", encoding="utf-8") as f:
+                    json.dump(pages_data, f, indent=2, ensure_ascii=False)
+                
+                # Also generate and save issues.json
+                issues = aggregate_issues(pages_data)
+                issues_file = PAGES_ISSUES_DIR / f"{jobId}_issues.json"
+                
+                # Load existing issues to preserve TA reviews
+                existing_issues = []
+                if issues_file.exists():
+                    try:
+                        with open(issues_file, "r", encoding="utf-8") as f:
+                            existing_issues_data = json.load(f)
+                            existing_issues = existing_issues_data.get("issues", [])
+                    except Exception:
+                        pass
+                
+                # Merge TA reviews from existing issues
+                existing_issues_dict = {issue.get("issue_id"): issue for issue in existing_issues}
+                for issue in issues:
+                    existing_issue = existing_issues_dict.get(issue["issue_id"])
+                    if existing_issue and existing_issue.get("ta_review"):
+                        issue["ta_review"] = existing_issue["ta_review"]
+                
+                with open(issues_file, "w", encoding="utf-8") as f:
+                    json.dump({"issues": issues}, f, indent=2, ensure_ascii=False)
+                
+                return {"jobId": jobId, "pages": pages_data}
+    except Exception as e:
+        print(f"Error generating pages from analysis results: {e}")
+    
+    return {"jobId": jobId, "pages": []}
 
 
 @app.get("/api/list-jobs")
@@ -1101,7 +2953,9 @@ PROMPT_REFINEMENT_DIR.mkdir(parents=True, exist_ok=True)
 refinement_sessions: Dict[str, Dict[str, Any]] = {}
 
 
-# Path to saved prompt file
+# Path to grading prompt file (primary prompt for grading)
+GRADING_PROMPT_FILE = Path(__file__).parent.parent / "output_static" / "grading_prompt.txt"
+# Legacy path for backward compatibility
 SAVED_PROMPT_FILE = Path(__file__).parent.parent / "output_static" / "saved_prompt.txt"
 
 # Default refined prompt template (from saved_prompt.txt)
@@ -1493,9 +3347,411 @@ IMPORTANT: Keep ALL text fields SHORT to prevent JSON truncation:
 }"""
 
 
+def convert_page_analysis_to_legacy(page_analysis: Dict[str, Any], page_number: int) -> Dict[str, Any]:
+    """Convert new PageAnalysis format to legacy PageAnalysisResult format for backward compatibility."""
+    legacy = {
+        "page_number": page_number,
+        "skip_analysis": False,
+        "page_type": page_analysis.get("page_role", "other"),
+        "extracted_violations": [],
+        "feedback": "",
+        "compelling": None,
+    }
+    
+    # Convert page_role to page_type
+    role_to_type = {
+        "intro": "introduction page",
+        "group_collab": "group collaboration page",
+        "heuristic_explainer": "heuristic explainer page",
+        "violation_detail": "heuristic violation analysis",
+        "severity_summary": "severity summary page",
+        "conclusion": "conclusion page",
+        "other": "other",
+    }
+    legacy["page_type"] = role_to_type.get(page_analysis.get("page_role", "other"), "other")
+    
+    # Convert fragments to extracted_violations
+    fragments = page_analysis.get("fragments", [])
+    for frag in fragments:
+        heuristic_id = frag.get("heuristic_id", "")
+        # Extract heuristic number from "H1", "H2", etc.
+        heuristic_num = None
+        if heuristic_id.startswith("H") and len(heuristic_id) > 1:
+            try:
+                num_str = heuristic_id[1:].split("_")[0]  # Handle "H1", "Hx_unknown"
+                if num_str.isdigit():
+                    heuristic_num = int(num_str)
+            except:
+                pass
+        
+        if heuristic_num and 1 <= heuristic_num <= 10:
+            violation = {
+                "heuristic_num": heuristic_num,
+                "heuristic_number": heuristic_num,
+                "heuristic_name": f"Heuristic {heuristic_num}",
+                "description": frag.get("text_summary", ""),
+                "severity": frag.get("severity_hint", ""),
+            }
+            legacy["extracted_violations"].append(violation)
+    
+    # Generate feedback from fragments and page info
+    feedback_parts = []
+    if page_analysis.get("main_heading"):
+        feedback_parts.append(f"Page Title: {page_analysis['main_heading']}")
+    
+    if fragments:
+        feedback_parts.append(f"Found {len(fragments)} heuristic issue(s):")
+        for frag in fragments:
+            feedback_parts.append(f"- {frag.get('heuristic_id', 'Unknown')}: {frag.get('text_summary', '')}")
+    else:
+        feedback_parts.append("No specific heuristic violations identified on this page.")
+    
+    # Add severity summary info if present
+    if page_analysis.get("severity_summary"):
+        summary = page_analysis["severity_summary"]
+        feedback_parts.append(f"Severity Summary: {summary.get('visualization', 'unknown')} visualization, "
+                            f"coverage: {summary.get('coverage_scope', 'unclear')}, "
+                            f"clarity: {summary.get('mapping_clarity', 'unclear')}")
+        if summary.get("llm_note"):
+            feedback_parts.append(f"Note: {summary['llm_note']}")
+    
+    legacy["feedback"] = "\n".join(feedback_parts)
+    
+    # Set compelling based on rubric relevance
+    relevance = page_analysis.get("rubric_relevance", {})
+    high_relevance_count = sum(1 for v in relevance.values() if v == "high")
+    legacy["compelling"] = high_relevance_count >= 2
+    
+    return legacy
+
+
+def aggregate_issues(pages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Aggregate fragments from multiple PageAnalysis objects into Issue objects.
+    
+    Args:
+        pages: List of PageAnalysis dictionaries (from structured_analysis field)
+    
+    Returns:
+        List of Issue dictionaries
+    """
+    # Group fragments by heuristic_id + issue_key
+    # Only include fragments from violation_detail pages (exclude intro, conclusion, severity_summary, etc.)
+    fragment_groups: Dict[str, List[Dict[str, Any]]] = {}
+    
+    for page in pages:
+        page_role = page.get("page_role", "other")
+        page_id = page.get("page_id", f"p{page.get('page_number', 0):02d}")
+        fragments = page.get("fragments", [])
+        screenshot_cluster_id = page.get("screenshot_cluster_id")
+        
+        # Filter logic:
+        # - Skip if page_role is conclusion/intro/severity_summary/group_collab/heuristic_explainer/other AND has no fragments
+        # - Include if page_role is violation_detail (always has fragments)
+        # - Include if page has fragments (even if page_role is conclusion/intro/etc, it means the page contains heuristic detail)
+        if page_role not in ["violation_detail"] and len(fragments) == 0:
+            # This is a pure non-violation page with no heuristic content, skip it
+            continue
+        
+        # If we reach here, either:
+        # 1. page_role is violation_detail, OR
+        # 2. page has fragments (even if page_role is conclusion/intro/etc)
+        
+        for frag in fragments:
+            heuristic_id = frag.get("heuristic_id", "")
+            issue_key = frag.get("issue_key", "")
+            
+            # Skip fragments with unknown or invalid heuristic_id
+            # Only process H1-H10 (valid Nielsen heuristics)
+            if not heuristic_id or heuristic_id.startswith("Hx") or heuristic_id == "Hx_unknown":
+                continue
+            
+            # Validate heuristic_id format (H1-H10)
+            heuristic_num_str = heuristic_id.replace("H", "").replace("h", "").split("_")[0]
+            try:
+                heuristic_num = int(heuristic_num_str)
+                if heuristic_num < 1 or heuristic_num > 10:
+                    continue  # Skip invalid heuristic numbers
+            except (ValueError, TypeError):
+                continue  # Skip if cannot parse as number
+            
+            # Create a unique key for grouping
+            group_key = f"{heuristic_id}::{issue_key}"
+            
+            if group_key not in fragment_groups:
+                fragment_groups[group_key] = []
+            
+            # Store fragment with page context
+            fragment_groups[group_key].append({
+                "fragment": frag,
+                "page_id": page_id,
+                "screenshot_cluster_id": screenshot_cluster_id,
+            })
+    
+    # Convert groups to Issues
+    issues = []
+    issue_counter = 1
+    
+    for group_key, group_fragments in fragment_groups.items():
+        if not group_fragments:
+            continue
+        
+        # Extract heuristic_id and issue_key from group_key
+        parts = group_key.split("::", 1)
+        heuristic_id = parts[0] if len(parts) > 0 else "Hx_unknown"
+        issue_key = parts[1] if len(parts) > 1 else f"issue_{issue_counter}"
+        
+        # Collect unique page_ids and screenshot_cluster_ids
+        # Double-check: verify all pages in this group are actually violation_detail pages
+        page_ids = set()
+        screenshot_cluster_ids = set()
+        all_fragments = []
+        
+        for item in group_fragments:
+            # Find the original page to verify it has fragments (defensive check)
+            page_id = item["page_id"]
+            original_page = next((p for p in pages if p.get("page_id") == page_id or f"p{p.get('page_number', 0):02d}" == page_id), None)
+            
+            # Skip if page has no fragments (defensive check - should not happen if first filter worked)
+            if original_page and len(original_page.get("fragments", [])) == 0:
+                continue
+            
+            page_ids.add(page_id)
+            if item.get("screenshot_cluster_id"):
+                screenshot_cluster_ids.add(item["screenshot_cluster_id"])
+            all_fragments.append(item["fragment"])
+        
+        # Skip this issue if no valid fragments remain after filtering
+        if not all_fragments:
+            continue
+        
+        # Generate title from first fragment's text_summary
+        first_fragment = all_fragments[0]
+        title_text = first_fragment.get("text_summary", "").strip()
+        # Take first sentence or first 60 chars, whichever is shorter
+        # Try to extract first sentence
+        first_sentence = title_text.split('.')[0].strip()
+        if first_sentence and len(first_sentence) <= 60:
+            title = first_sentence
+        elif len(title_text) > 60:
+            # Take first 60 chars and try to break at word boundary
+            truncated = title_text[:60]
+            last_space = truncated.rfind(' ')
+            if last_space > 40:  # Only break at word if we have enough content
+                title = truncated[:last_space] + "..."
+            else:
+                title = truncated + "..."
+        else:
+            title = title_text or f"{heuristic_id} Issue"
+        
+        # Combine descriptions
+        descriptions = [f.get("text_summary", "") for f in all_fragments if f.get("text_summary")]
+        combined_description = " ".join(descriptions)
+        
+        # Determine AI proposed severity
+        severity_hints = [f.get("severity_hint") for f in all_fragments if f.get("severity_hint")]
+        severity_map = {"minor": 1, "major": 2, "critical": 3}
+        max_severity = "major"  # default
+        if severity_hints:
+            max_severity_value = max([severity_map.get(s, 0) for s in severity_hints])
+            max_severity = [k for k, v in severity_map.items() if v == max_severity_value][0] if max_severity_value > 0 else "major"
+        
+        # Generate AI severity rationale
+        ai_severity_rationale = f"Based on {len(all_fragments)} fragment(s) across {len(page_ids)} page(s). "
+        if severity_hints:
+            ai_severity_rationale += f"Severity hints: {', '.join(set(severity_hints))}. "
+        ai_severity_rationale += f"Description: {combined_description[:200]}"
+        
+        # Create Issue object
+        issue = {
+            "issue_id": f"issue_{issue_counter:03d}",
+            "heuristic_id": heuristic_id,
+            "issue_key": issue_key,
+            "title": title,
+            "combined_description": combined_description,
+            "pages_involved": sorted(list(page_ids)),
+            "screenshot_cluster_ids": sorted(list(screenshot_cluster_ids)),
+            "ai_proposed_severity": max_severity,
+            "ai_severity_rationale": ai_severity_rationale,
+            "ta_review": None,  # Will be filled by TA in reviewer mode
+        }
+        
+        issues.append(issue)
+        issue_counter += 1
+    
+    return issues
+
+
+def get_page_analysis_prompt(page_number: int, page_content: str, has_image: bool) -> str:
+    """Generate prompt for structured page analysis (PageAnalysis format)."""
+    word_count = len(page_content.split())
+    image_note = "with screenshot/image" if has_image else "text only"
+    
+    prompt = f"""You are analyzing a single page from a student's heuristic evaluation assignment. Your task is to extract structured information about what this page contains and how it relates to the grading rubric.
+
+PAGE CONTENT:
+Page {page_number} ({word_count} words, {image_note})
+---
+{page_content[:2500]}
+---
+
+NIELSEN HEURISTICS REFERENCE:
+1. Visibility of System Status
+2. Match Between System and the Real World
+3. User Control and Freedom
+4. Consistency and Standards
+5. Error Prevention
+6. Recognition Rather Than Recall
+7. Flexibility and Efficiency of Use
+8. Aesthetic and Minimalist Design
+9. Help Users Recognize, Diagnose, and Recover from Errors
+10. Help and Documentation
+
+TASK: Generate a compact JSON object describing this page's role, relevance to rubric dimensions, and any heuristic/issue fragments it discusses.
+
+OUTPUT FORMAT (JSON):
+{{
+  "page_id": "p{page_number:02d}",
+  "page_number": {page_number},
+  "page_role": "<one of: intro, group_collab, heuristic_explainer, violation_detail, severity_summary, conclusion, ai_opportunities, other>",
+  "main_heading": "<main title/heading on the page, if any, max 50 chars>",
+  "has_annotations": "<none|low|medium|high>",
+  "rubric_relevance": {{
+    "coverage": "<none|low|med|high>",
+    "violation_quality": "<none|low|med|high>",
+    "severity_analysis": "<none|low|med|high>",
+    "screenshots_evidence": "<none|low|med|high>",
+    "group_integration": "<none|low|med|high>",
+    "professional_quality": "<none|low|med|high>",
+    "writing_quality": "<none|low|med|high>"
+  }},
+  "screenshot_cluster_id": "<optional: e.g., 'ss_1' if this page shares screenshot with other pages>",
+  "fragments": [
+    {{
+      "heuristic_id": "<H1-H10 or Hx_unknown>",
+      "issue_key": "<2-6 words, snake_case, e.g., 'navbar_low_contrast'>",
+      "fragment_role": ["<problem_description|impact|evidence|design_rationale|fix_idea>", ...],
+      "text_summary": "<1-2 sentences, paraphrase what page says about this issue>",
+      "severity_hint": "<optional: minor|major|critical>",
+      "rubric_tags": ["<optional: coverage|violation_quality|severity_analysis|screenshots_evidence>", ...]
+    }}
+  ],
+  "severity_summary": {{
+    "is_summary": true,
+    "visualization": "<table|plot|mixed|text_only>",
+    "coverage_scope": "<all_issues|major_issues_only|unclear>",
+    "mapping_clarity": "<clear|somewhat_clear|unclear>",
+    "llm_note": "<1-2 sentences describing the visualization>"
+  }},
+  "ai_opportunities_info": {{
+    "present": true,
+    "raw_text_excerpt": "<3-6 sentences, concise extract/paraphrase of AI ideas>",
+    "llm_summary": "<2-3 sentence summary of what AI is supposed to do>",
+    "relevance_to_violations": "<low|med|high>",
+    "specificity": "<generic|somewhat_specific|very_specific>"
+  }}
+}}
+NOTE: 
+- Only include "severity_summary" field if page_role === "severity_summary". Otherwise omit this field entirely.
+- Only include "ai_opportunities_info" field if page_role === "ai_opportunities". Otherwise omit this field entirely.
+
+RULES:
+1. page_role: Pick ONE dominant role:
+   - "intro": Introduces project/site/overall structure
+   - "group_collab": Talks about team roles, collaboration, division of work
+   - "heuristic_explainer": Defines Nielsen's heuristics generically (not site-specific)
+   - "violation_detail": Analyzes specific problems on target website (with screenshots/bullets)
+   - "severity_summary": Summarizes severity across issues (tables/plots)
+   - "conclusion": Conclusions, reflections, limitations, learnings, next steps
+   - "ai_opportunities": Page mainly discusses how AI, machine learning, chatbots, recommendation systems, etc. could be used to address the problems found on the Julian site. The page should propose concrete AI solutions tied to specific violations or usability issues.
+   - "other": Doesn't fit above
+
+   **Important disambiguation between "conclusion" and "violation_detail":**
+   - If the main heading clearly contains words like "Conclusion", "Conclusions", "Summary & Reflection", "Final Thoughts", or similar wrap‑up language, and the page is primarily summarizing takeaways or reflecting on the work, you MUST set `page_role = "conclusion"` (even if it briefly mentions heuristics or issues).
+   - Only use `page_role = "violation_detail"` when the page's main purpose is to introduce or deeply analyze specific problems (often with focused screenshots and detailed bullets), not when it is mainly a course/project conclusion slide.
+   - For true conclusion pages, do NOT treat summary bullets as new violation analysis; those pages should be classified as "conclusion" and handled as such in later scoring.
+
+2. rubric_relevance: Rate how much this page matters for each dimension:
+   - "none": Page doesn't address this dimension at all
+   - "low": Page mentions it briefly
+   - "med": Page has some content relevant to this dimension
+   - "high": Page is primarily about this dimension
+   
+   Specific guidance:
+   - coverage: Does this page help demonstrate how many heuristics/issues the student covered?
+   - violation_quality: Does this page include detailed, thoughtful analysis of specific problems?
+   - severity_analysis: Does this page reason about severity levels (major/minor/critical)?
+   - screenshots_evidence: Does this page provide clear evidence (screenshots, annotations)?
+   - group_integration: Does this page talk about group collaboration or how parts fit together?
+   - professional_quality: Layout, visual design, information hierarchy, overall slide professionalism.
+     Examples: Well-organized layout with color/alignment emphasizing structure → "high".
+     Text blends into background, high saturation colors, irrelevant patterns affecting readability → "low".
+   - writing_quality: Is text clear, logical, with grammar/spelling that doesn't hinder understanding?
+     Examples: Long analysis written clearly → "high"; grammar errors, simple sentences → "med"; pure bullets, incomplete sentences → "low".
+
+3. fragments: List 0-5 HeuristicFragment objects:
+   - CRITICAL: Only include fragments if page_role === "violation_detail"
+   - For intro, conclusion, severity_summary, group_collab, heuristic_explainer, or other pages, set fragments to [] (empty array)
+   - Even if a conclusion or intro page mentions heuristics or issues, do NOT create fragments for them
+   - One fragment = "this page says something substantive about one heuristic + one issue"
+   - heuristic_id: "H1" to "H10" (or "Hx_unknown" if unclear)
+   - issue_key: 2-6 words, lowercase, snake_case (e.g., "search_bar_mobile_hidden")
+   - fragment_role: 1-3 roles from [problem_description, impact, evidence, design_rationale, fix_idea]
+   - text_summary: 1-2 sentences, paraphrase (NO copy-paste)
+   - severity_hint: Optional, only if page clearly suggests severity
+   - rubric_tags: Optional, which rubric dimensions this fragment contributes to
+
+4. severity_summary: Only include if page_role === "severity_summary"
+   - visualization: "table" | "plot" | "mixed" | "text_only"
+   - coverage_scope: "all_issues" | "major_issues_only" | "unclear"
+   - mapping_clarity: "clear" | "somewhat_clear" | "unclear"
+   - llm_note: 1-2 sentences describing the visualization
+
+5. ai_opportunities_info: Only include if page_role === "ai_opportunities"
+   - present: Always true when this field is included
+   - raw_text_excerpt: 3-6 sentences, concise extract/paraphrase of the student's AI ideas (not the whole page, but enough for later scoring)
+   - llm_summary: 2-3 sentence summary of what AI is supposed to do
+   - relevance_to_violations:
+     * "high": AI ideas clearly reference specific problems or heuristics discussed earlier
+     * "med": Partially connected to violations
+     * "low": Mostly generic, not tied to specific violations
+   - specificity:
+     * "very_specific": Ideas are concrete and plausible (e.g., "AI-driven skeleton screens for slow loading product pages")
+     * "somewhat_specific": Some details but also generic statements
+     * "generic": Mostly "AI can improve everything" without concrete mechanisms
+
+6. Keep it compact:
+   - text_summary ≤ 2 sentences
+   - llm_note ≤ 2 sentences
+   - At most 5 fragments per page
+   - Paraphrase, don't copy long quotes
+   - main_heading max 50 characters
+
+CRITICAL: Output ONLY valid JSON. No markdown, no explanations, just the JSON object."""
+    
+    return prompt
+
+
 def get_current_prompt() -> str:
-    """Get the current analysis prompt. First try saved prompt, then use default refined prompt, then generate from function."""
-    # Try to load saved prompt first
+    """Get the current grading prompt. First try grading_prompt.txt, then saved_prompt.txt (legacy), then use default."""
+    # Try to load grading_prompt.txt first (primary prompt file)
+    if GRADING_PROMPT_FILE.exists():
+        try:
+            with open(GRADING_PROMPT_FILE, "r", encoding="utf-8") as f:
+                prompt = f.read().strip()
+                # Remove markdown code fences if present
+                if prompt.startswith("```"):
+                    prompt = prompt.split("```", 2)[-1].strip()
+                if prompt.endswith("```"):
+                    prompt = prompt.rsplit("```", 1)[0].strip()
+                if prompt.endswith("---"):
+                    prompt = prompt.rsplit("---", 1)[0].strip()
+                if prompt:
+                    return prompt
+        except Exception as e:
+            print(f"[WARNING] Failed to load grading_prompt.txt: {e}")
+    
+    # Fallback to legacy saved_prompt.txt
     if SAVED_PROMPT_FILE.exists():
         try:
             with open(SAVED_PROMPT_FILE, "r", encoding="utf-8") as f:
@@ -1510,20 +3766,29 @@ def get_current_prompt() -> str:
                 if saved_prompt:
                     return saved_prompt
         except Exception as e:
-            print(f"Error loading saved prompt: {e}")
+            print(f"[WARNING] Failed to load saved_prompt.txt: {e}")
     
     # Fallback: Use default refined prompt template
     return DEFAULT_REFINED_PROMPT
 
 def save_prompt_to_backend(prompt: str) -> bool:
-    """Save prompt to backend permanently."""
+    """Save prompt to backend permanently. Saves to grading_prompt.txt (primary) and optionally to saved_prompt.txt (legacy)."""
     try:
+        # Save to primary grading_prompt.txt
+        GRADING_PROMPT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(GRADING_PROMPT_FILE, "w", encoding="utf-8") as f:
+            f.write(prompt)
+        print(f"[INFO] Prompt saved to {GRADING_PROMPT_FILE}")
+        
+        # Also save to legacy saved_prompt.txt for backward compatibility
         SAVED_PROMPT_FILE.parent.mkdir(parents=True, exist_ok=True)
         with open(SAVED_PROMPT_FILE, "w", encoding="utf-8") as f:
             f.write(prompt)
+        print(f"[INFO] Prompt also saved to legacy {SAVED_PROMPT_FILE}")
+        
         return True
     except Exception as e:
-        print(f"Error saving prompt: {e}")
+        print(f"[ERROR] Failed to save prompt: {e}")
         return False
 
 
@@ -1666,11 +3931,24 @@ async def critique_prompt(request: Dict[str, Any]) -> Dict[str, Any]:
 CRITICAL REQUIREMENTS TO CHECK:
 - The prompt must NOT add new categories to score_breakdown. It should only use the existing categories defined in the rubric.
 - The prompt must ensure that grading considers evaluations from ALL pages and synthesizes them comprehensively for final scoring, not just evaluating pages in isolation.
+-- The prompt must NOT change the ScoringInput or ScoringOutput JSON schemas, and must NOT add/remove/rename ANY keys in those structures. Treat those JSON field names and structures as a fixed API contract.
+-- The overall section structure, headings, and numbering of the grading prompt should remain stable. Recommend incremental, local edits (clarifications, wording tweaks) instead of large-scale rewrites.
 
 CRITICAL: LLM CAPABILITY CONSTRAINTS - You MUST evaluate whether the prompt accounts for these limitations:
+
+**CORE PRINCIPLE: The prompt must be ACCURATE, CONCISE, EFFECTIVE, and LLM-UNDERSTANDABLE.**
+
+When critiquing the prompt, you MUST ensure it:
+1. **Accuracy**: Preserves all essential grading criteria and requirements
+2. **Conciseness**: Uses the most minimal language possible while maintaining clarity
+3. **Effectiveness**: Achieves the grading goals with maximum efficiency
+4. **LLM-Understandability**: Written in language that LLMs can reliably parse and execute
+
+**Specific LLM Limitations to Consider:**
    - LLMs are prone to JSON formatting errors, especially with arrays and nested structures
    - Array handling is particularly fragile: LLMs may truncate arrays, omit closing brackets, or create malformed JSON
    - Debugging JSON parsing errors is time-consuming and costly
+   - Complex instructions increase the risk of misinterpretation or partial execution
    - When critiquing the prompt, check if it:
      * Minimizes complex nested JSON structures (especially arrays within arrays)
      * Prefers flat structures over deeply nested ones
@@ -1679,7 +3957,9 @@ CRITICAL: LLM CAPABILITY CONSTRAINTS - You MUST evaluate whether the prompt acco
      * Avoids requiring LLMs to generate large arrays (if possible, uses simpler data structures)
      * Explicitly instructs the LLM to properly close all brackets and arrays
      * Uses string-based formats or simpler structures instead of complex nested arrays when possible
-   - If the prompt has complex array structures, suggest simplifications to reduce JSON parsing failure risk
+     * Uses direct, unambiguous language that LLMs can easily understand
+     * Avoids ambiguous phrasing or complex conditional logic
+   - If the prompt has complex array structures or unclear instructions, suggest simplifications to reduce JSON parsing failure risk and improve LLM comprehension
 
 GRADING PROMPT TO CRITIQUE ({prompt_label}):
 ---
@@ -1820,11 +4100,24 @@ Your task:
    - Is clear for both AI and human reviewers
    - MUST NOT add new categories to score_breakdown (only use existing rubric categories)
    - MUST ensure grading synthesizes evaluations from ALL pages comprehensively, not just evaluating pages in isolation
+   - MUST NOT change the ScoringInput or ScoringOutput JSON schemas, and MUST NOT add/remove/rename ANY keys in those structures. Treat all JSON field names and structures as a fixed API contract.
+   - SHOULD keep the existing top-level sections, headings, and numbering. Make conservative, local edits rather than rewriting the entire prompt.
    
 CRITICAL: LLM CAPABILITY CONSTRAINTS - You MUST consider these limitations when refining the prompt:
+
+**CORE PRINCIPLE: The refined prompt must be ACCURATE, CONCISE, EFFECTIVE, and LLM-UNDERSTANDABLE.**
+
+When designing the prompt, you MUST:
+1. **Accuracy**: Preserve all essential grading criteria and requirements
+2. **Conciseness**: Use the most minimal language possible while maintaining clarity - every word should serve a purpose
+3. **Effectiveness**: Achieve grading goals with maximum efficiency - avoid redundancy
+4. **LLM-Understandability**: Write in language that LLMs can reliably parse and execute - use direct, unambiguous instructions
+
+**Specific LLM Limitations to Address:**
    - LLMs are prone to JSON formatting errors, especially with arrays and nested structures
    - Array handling is particularly fragile: LLMs may truncate arrays, omit closing brackets, or create malformed JSON
    - Debugging JSON parsing errors is time-consuming and costly
+   - Complex instructions increase the risk of misinterpretation or partial execution
    - When designing the prompt, you MUST:
      * Minimize complex nested JSON structures (especially arrays within arrays)
      * Prefer flat structures over deeply nested ones
@@ -1833,7 +4126,9 @@ CRITICAL: LLM CAPABILITY CONSTRAINTS - You MUST consider these limitations when 
      * Avoid requiring LLMs to generate large arrays (if possible, use simpler data structures)
      * Ensure the prompt explicitly instructs the LLM to properly close all brackets and arrays
      * Consider using string-based formats or simpler structures instead of complex nested arrays when possible
-   - The refined prompt should be designed to minimize the risk of JSON parsing failures and array corruption
+     * Use direct, unambiguous language that LLMs can easily understand
+     * Avoid ambiguous phrasing or complex conditional logic
+   - The refined prompt should be designed to minimize the risk of JSON parsing failures, array corruption, and LLM misinterpretation
 
 ORIGINAL PROMPT (P0):
 ---
@@ -1990,7 +4285,15 @@ Please evaluate each prompt (0-10 points) based on:
 5. Adherence to critical requirements:
    - Does the prompt avoid adding new categories to score_breakdown (only uses existing rubric categories)?
    - Does the prompt ensure grading synthesizes evaluations from ALL pages comprehensively, not just evaluating pages in isolation?
-6. LLM capability constraints - Does the prompt account for LLM limitations, especially JSON/array handling?
+6. LLM capability constraints - **CRITICAL PRINCIPLE: The prompt must be ACCURATE, CONCISE, EFFECTIVE, and LLM-UNDERSTANDABLE.**
+   
+   **Core Evaluation Criteria:**
+   - **Accuracy**: Does the prompt preserve all essential grading criteria and requirements?
+   - **Conciseness**: Does it use the most minimal language possible while maintaining clarity? (Every word should serve a purpose)
+   - **Effectiveness**: Does it achieve grading goals with maximum efficiency? (Avoids redundancy)
+   - **LLM-Understandability**: Is it written in language that LLMs can reliably parse and execute? (Uses direct, unambiguous instructions)
+   
+   **Specific Technical Checks:**
    - Does it minimize complex nested JSON structures (especially arrays within arrays)?
    - Does it prefer flat structures over deeply nested ones?
    - Does it keep array elements simple and well-defined?
@@ -1998,7 +4301,8 @@ Please evaluate each prompt (0-10 points) based on:
    - Does it avoid requiring LLMs to generate large arrays (uses simpler data structures when possible)?
    - Does it explicitly instruct the LLM to properly close all brackets and arrays?
    - Does it use string-based formats or simpler structures instead of complex nested arrays when possible?
-   - CRITICAL: Prompts that minimize JSON parsing failure risk and array corruption should be preferred, as debugging JSON errors is time-consuming and costly
+   - Does it avoid ambiguous phrasing or complex conditional logic?
+   - **CRITICAL: Prompts that minimize JSON parsing failure risk, array corruption, and LLM misinterpretation should be strongly preferred, as debugging JSON errors and fixing misunderstandings is time-consuming and costly**
 
 Then:
 1. Provide a scoring table for all candidates
@@ -2132,6 +4436,492 @@ async def save_prompt(request: Dict[str, Any]) -> Dict[str, Any]:
         }
     else:
         raise HTTPException(status_code=500, detail="Failed to save prompt")
+
+
+# ============================================================================
+# Ruthless Multi-panel Audit System
+# ============================================================================
+
+RUTHLESS_AUDIT_DIR = Path(__file__).parent.parent / "output_static" / "ruthless_audits"
+RUTHLESS_AUDIT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+async def run_ruthless_audit(prompt: str, system_context: str = "") -> Dict[str, Any]:
+    """
+    Run a ruthless multi-panel audit on the grading prompt/system.
+    This is a comprehensive architectural review, governance check, rot analysis,
+    system critique, and recommendation generation.
+    
+    Returns a detailed audit report with:
+    - Architectural issues
+    - Governance violations
+    - Technical debt / rot
+    - System weaknesses
+    - Recommendations
+    """
+    audit_prompt = f"""You are conducting a RUTHLESS MULTI-PANEL AUDIT of an autograder system's grading prompt and architecture.
+
+This is a comprehensive quality gate review that should be thorough, critical, and constructive.
+
+SYSTEM CONTEXT:
+{system_context if system_context else "Autograder for UX/HCI heuristic evaluation assignments. System uses LLM (Gemini) to grade student submissions page-by-page, then aggregates into issues and final scores."}
+
+CURRENT GRADING PROMPT:
+```
+{prompt}
+```
+
+CONDUCT A COMPREHENSIVE AUDIT ACROSS THESE DIMENSIONS:
+
+1. **ARCHITECTURAL REVIEW**
+   - Is the prompt structure logical and maintainable?
+   - Are there clear separation of concerns?
+   - Is the prompt too monolithic or appropriately modular?
+   - Are there missing abstractions or over-engineering?
+
+2. **GOVERNANCE CHECK**
+   - Does the prompt follow best practices for LLM prompt engineering?
+   - Are there safety concerns (bias, fairness, accuracy)?
+   - Are evaluation criteria clear and unambiguous?
+   - Is there proper error handling guidance?
+
+3. **ROT ANALYSIS**
+   - Are there outdated instructions or deprecated patterns?
+   - Is there technical debt in the prompt structure?
+   - Are there inconsistencies or contradictions?
+   - Is the prompt becoming too complex or bloated?
+
+4. **SYSTEM CRITIQUE**
+   - What are the fundamental weaknesses in the current approach?
+   - Are there edge cases not handled?
+   - Is the prompt too rigid or too flexible?
+   - Are there scalability concerns?
+
+5. **RECOMMENDATION GENERATION**
+   - What specific improvements should be made?
+   - What should be prioritized (P0, P1, P2)?
+   - What are the risks of NOT making these changes?
+   - What are quick wins vs. long-term improvements?
+
+OUTPUT FORMAT (JSON):
+{{
+  "audit_id": "audit-<timestamp>",
+  "timestamp": "<ISO timestamp>",
+  "summary": "1-2 sentence executive summary",
+  "architectural_issues": [
+    {{
+      "severity": "critical|high|medium|low",
+      "category": "structure|modularity|abstraction|maintainability",
+      "issue": "Description of the issue",
+      "impact": "What this means for the system",
+      "recommendation": "What should be done"
+    }}
+  ],
+  "governance_violations": [
+    {{
+      "severity": "critical|high|medium|low",
+      "category": "bias|fairness|accuracy|safety|clarity",
+      "issue": "Description of the violation",
+      "impact": "What this means for grading quality",
+      "recommendation": "What should be done"
+    }}
+  ],
+  "rot_analysis": [
+    {{
+      "severity": "critical|high|medium|low",
+      "category": "outdated|debt|inconsistency|complexity",
+      "issue": "Description of the rot",
+      "impact": "What this means long-term",
+      "recommendation": "What should be done"
+    }}
+  ],
+  "system_critique": [
+    {{
+      "severity": "critical|high|medium|low",
+      "category": "weakness|edge_case|rigidity|scalability",
+      "issue": "Description of the critique",
+      "impact": "What this means for the system",
+      "recommendation": "What should be done"
+    }}
+  ],
+  "prioritized_recommendations": [
+    {{
+      "priority": "P0|P1|P2",
+      "category": "architectural|governance|rot|system",
+      "title": "Short title",
+      "description": "Detailed description",
+      "effort": "low|medium|high",
+      "impact": "low|medium|high",
+      "risk_if_not_done": "What happens if we don't fix this"
+    }}
+  ],
+  "quick_wins": [
+    "List of easy improvements that can be made immediately"
+  ],
+  "long_term_improvements": [
+    "List of strategic improvements for future iterations"
+  ],
+  "overall_assessment": "Overall health score and assessment (1-2 paragraphs)"
+}}
+
+Be RUTHLESS but CONSTRUCTIVE. This is a quality gate - find real problems, not just minor suggestions.
+The prompt will be long. The answer even longer. This is normal and expected for a comprehensive audit.
+"""
+    
+    try:
+        generation_config = {
+            "temperature": 0.3,  # Lower temperature for more consistent, critical analysis
+            "max_output_tokens": 16384,  # Long response expected
+            "response_mime_type": "application/json",
+        }
+        
+        response = MODEL.generate_content(audit_prompt, generation_config=generation_config)
+        
+        # Extract JSON from response
+        response_text = response.text.strip()
+        if response_text.startswith("```json"):
+            response_text = response_text[7:].strip()
+        if response_text.startswith("```"):
+            response_text = response_text[3:].strip()
+        if response_text.endswith("```"):
+            response_text = response_text[:-3].strip()
+        
+        audit_result = json.loads(response_text)
+        
+        # Add timestamp if not present
+        if "timestamp" not in audit_result:
+            audit_result["timestamp"] = datetime.now().isoformat()
+        if "audit_id" not in audit_result:
+            audit_result["audit_id"] = f"audit-{int(time.time() * 1000)}"
+        
+        # Save audit to file
+        audit_file = RUTHLESS_AUDIT_DIR / f"{audit_result['audit_id']}.json"
+        with open(audit_file, "w", encoding="utf-8") as f:
+            json.dump({
+                "audit_result": audit_result,
+                "prompt_audited": prompt,
+                "system_context": system_context,
+            }, f, indent=2, ensure_ascii=False)
+        
+        return audit_result
+    except Exception as e:
+        print(f"[ERROR] Ruthless audit failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to run ruthless audit: {str(e)}")
+
+
+@app.post("/api/ruthless-audit")
+async def ruthless_audit_endpoint(request: Dict[str, Any]) -> Dict[str, Any]:
+    """Run a ruthless multi-panel audit on the current grading prompt."""
+    prompt = request.get("prompt", "")
+    system_context = request.get("systemContext", "")
+    
+    if not prompt:
+        # Load current prompt if not provided
+        prompt = get_current_prompt()
+    
+    audit_result = await run_ruthless_audit(prompt, system_context)
+    
+    return {
+        "status": "success",
+        "audit": audit_result,
+    }
+
+
+# ============================================================================
+# Enhanced Prompt Refinement Pipeline (Multi-Plan Generation & Comparison)
+# ============================================================================
+
+async def generate_multiple_plans(original_prompt: str, num_plans: int = 3) -> List[Dict[str, Any]]:
+    """
+    Generate 2-3 different grading strategy/evaluation plans.
+    Each plan should propose a different approach to improving the prompt.
+    """
+    plans_prompt = f"""You are an expert prompt engineer tasked with improving a grading prompt for an autograder system.
+
+CURRENT PROMPT:
+```
+{original_prompt}
+```
+
+Generate {num_plans} DIFFERENT and DISTINCT improvement plans. Each plan should propose a different strategic approach to improving this prompt, but **all plans must respect the existing JSON API contract**:
+- Do NOT change the ScoringInput or ScoringOutput JSON schemas.
+- Do NOT add, remove, or rename ANY keys or fields.
+- Do NOT propose restructuring the JSON sections; focus on wording, clarification, and rubric guidance.
+
+**CRITICAL PRINCIPLE: All improvements must prioritize making the prompt ACCURATE, CONCISE, EFFECTIVE, and LLM-UNDERSTANDABLE.**
+- **Accuracy**: Preserve all essential grading criteria
+- **Conciseness**: Use minimal language while maintaining clarity
+- **Effectiveness**: Achieve goals with maximum efficiency
+- **LLM-Understandability**: Use direct, unambiguous language that LLMs can reliably parse and execute
+
+Each plan should include:
+1. A clear strategy/approach (what's the main idea?)
+2. Specific improvements to make (prioritizing LLM-friendly structures and clear instructions)
+3. Rationale for why this approach would help (especially how it improves LLM comprehension and reduces parsing errors)
+4. Expected benefits (including reduced JSON parsing failures and improved LLM execution reliability)
+5. Potential risks or trade-offs
+
+OUTPUT FORMAT (JSON):
+{{
+  "plans": [
+    {{
+      "plan_id": "plan_1",
+      "strategy_name": "Short descriptive name",
+      "strategy_description": "1-2 sentences describing the overall approach",
+      "improvements": [
+        {{
+          "area": "What part of the prompt to improve",
+          "current_state": "What it currently does",
+          "proposed_change": "What to change it to",
+          "rationale": "Why this change helps"
+        }}
+      ],
+      "expected_benefits": [
+        "List of expected benefits"
+      ],
+      "potential_risks": [
+        "List of potential risks or trade-offs"
+      ],
+      "complexity": "low|medium|high",
+      "estimated_impact": "low|medium|high"
+    }}
+  ]
+}}
+
+Make sure the plans are DISTINCTLY different - not just variations of the same idea.
+Consider different angles: structural changes, clarity improvements, evaluation criteria refinement, error handling, etc.
+"""
+    
+    try:
+        generation_config = {
+            "temperature": 0.7,  # Higher temperature for more creative/diverse plans
+            "max_output_tokens": 8192,
+            "response_mime_type": "application/json",
+        }
+        
+        response = MODEL.generate_content(plans_prompt, generation_config=generation_config)
+        response_text = response.text.strip()
+        if response_text.startswith("```json"):
+            response_text = response_text[7:].strip()
+        if response_text.startswith("```"):
+            response_text = response_text[3:].strip()
+        if response_text.endswith("```"):
+            response_text = response_text[:-3].strip()
+        
+        plans_data = json.loads(response_text)
+        return plans_data.get("plans", [])
+    except Exception as e:
+        print(f"[ERROR] Failed to generate multiple plans: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to generate improvement plans: {str(e)}")
+
+
+async def compare_plans(plans: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Compare multiple plans, analyzing strengths and weaknesses of each.
+    """
+    plans_json = json.dumps(plans, indent=2)
+    
+    comparison_prompt = f"""You are an expert evaluator comparing multiple prompt improvement plans.
+
+PLANS TO COMPARE:
+{plans_json}
+
+**CRITICAL PRINCIPLE: Evaluate each plan based on whether it makes the prompt ACCURATE, CONCISE, EFFECTIVE, and LLM-UNDERSTANDABLE.**
+
+For each plan, analyze:
+1. **Strengths**: What does this plan do well? (Especially regarding LLM comprehension and execution reliability)
+2. **Weaknesses**: What are the limitations or concerns? (Especially regarding JSON parsing risks or LLM misinterpretation)
+3. **Feasibility**: How easy is it to implement? (Consider LLM's ability to execute the changes)
+4. **Impact**: How much would this improve the prompt? (Prioritize improvements that reduce parsing errors and improve LLM understanding)
+5. **Risk**: What could go wrong? (Especially JSON formatting errors, array corruption, or LLM confusion)
+6. **LLM-Friendliness**: Does this plan improve or worsen LLM's ability to understand and execute the prompt correctly?
+
+Then provide:
+- A comparison matrix showing how plans compare on key dimensions
+- Which plan is best for different scenarios
+- What elements from each plan could be combined
+
+OUTPUT FORMAT (JSON):
+{{
+  "comparison": [
+    {{
+      "plan_id": "plan_1",
+      "strengths": ["List of strengths"],
+      "weaknesses": ["List of weaknesses"],
+      "feasibility_score": 1-10,
+      "impact_score": 1-10,
+      "risk_score": 1-10,
+      "overall_assessment": "Overall assessment of this plan"
+    }}
+  ],
+  "comparison_matrix": {{
+    "dimensions": ["feasibility", "impact", "risk", "clarity", "maintainability"],
+    "scores": {{
+      "plan_1": [8, 7, 3, 9, 8],
+      "plan_2": [6, 9, 5, 7, 6],
+      "plan_3": [9, 6, 2, 8, 9]
+    }}
+  }},
+  "best_for_scenarios": {{
+    "quick_improvements": "plan_X",
+    "long_term_quality": "plan_Y",
+    "risk_minimization": "plan_Z"
+  }},
+  "combine_recommendation": "Which elements from which plans should be combined and why"
+}}
+"""
+    
+    try:
+        generation_config = {
+            "temperature": 0.4,  # Lower temperature for more analytical comparison
+            "max_output_tokens": 8192,
+            "response_mime_type": "application/json",
+        }
+        
+        response = MODEL.generate_content(comparison_prompt, generation_config=generation_config)
+        response_text = response.text.strip()
+        if response_text.startswith("```json"):
+            response_text = response_text[7:].strip()
+        if response_text.startswith("```"):
+            response_text = response_text[3:].strip()
+        if response_text.endswith("```"):
+            response_text = response_text[:-3].strip()
+        
+        comparison_result = json.loads(response_text)
+        return comparison_result
+    except Exception as e:
+        print(f"[ERROR] Failed to compare plans: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to compare plans: {str(e)}")
+
+
+async def synthesize_best_plan(original_prompt: str, plans: List[Dict[str, Any]], comparison: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Synthesize a "Best Combined Plan" by taking the best elements from each plan.
+    """
+    plans_json = json.dumps(plans, indent=2)
+    comparison_json = json.dumps(comparison, indent=2)
+    
+    synthesis_prompt = f"""You are synthesizing the BEST COMBINED PLAN from multiple improvement plans.
+
+ORIGINAL PROMPT:
+```
+{original_prompt}
+```
+
+AVAILABLE PLANS:
+{plans_json}
+
+COMPARISON ANALYSIS:
+{comparison_json}
+
+**CRITICAL PRINCIPLE: The improved prompt must be ACCURATE, CONCISE, EFFECTIVE, and LLM-UNDERSTANDABLE.**
+- **Accuracy**: Preserve all essential grading criteria and requirements
+- **Conciseness**: Use the most minimal language possible while maintaining clarity (every word should serve a purpose)
+- **Effectiveness**: Achieve grading goals with maximum efficiency (avoid redundancy)
+- **LLM-Understandability**: Write in language that LLMs can reliably parse and execute (use direct, unambiguous instructions, minimize complex JSON structures, avoid ambiguous phrasing)
+
+Create a BEST COMBINED PLAN that:
+1. Takes the strongest elements from each plan (prioritizing those that improve LLM comprehension and reduce parsing errors)
+2. Avoids the weaknesses identified in the comparison (especially those related to JSON complexity or LLM confusion)
+3. Creates a coherent, unified improvement strategy that maximizes LLM execution reliability
+4. Generates an improved prompt that incorporates the best ideas while ensuring it is LLM-friendly (minimizes JSON parsing failures, array corruption, and misinterpretation risks)
+5. STRICTLY preserves the ScoringInput and ScoringOutput JSON schemas and all existing key names. Do NOT add/remove/rename any fields or restructure those JSON sections. Focus improvements on explanatory text, rubric guidance, and clarity, while keeping the API contract unchanged.
+
+OUTPUT FORMAT (JSON):
+{{
+  "best_combined_plan": {{
+    "strategy_name": "Name of the combined approach",
+    "strategy_description": "Description of the combined strategy",
+    "elements_from_plans": {{
+      "plan_1": ["Which elements we're taking from plan 1"],
+      "plan_2": ["Which elements we're taking from plan 2"],
+      "plan_3": ["Which elements we're taking from plan 3"]
+    }},
+    "improved_prompt": "The full improved prompt text",
+    "improvement_summary": "Summary of what was improved and why",
+    "expected_benefits": ["List of expected benefits"],
+    "implementation_notes": "Notes on how to implement or test this"
+  }}
+}}
+"""
+    
+    try:
+        generation_config = {
+            "temperature": 0.5,
+            "max_output_tokens": 16384,  # Long response expected for full prompt
+            "response_mime_type": "application/json",
+        }
+        
+        response = MODEL.generate_content(synthesis_prompt, generation_config=generation_config)
+        response_text = response.text.strip()
+        if response_text.startswith("```json"):
+            response_text = response_text[7:].strip()
+        if response_text.startswith("```"):
+            response_text = response_text[3:].strip()
+        if response_text.endswith("```"):
+            response_text = response_text[:-3].strip()
+        
+        synthesis_result = json.loads(response_text)
+        return synthesis_result.get("best_combined_plan", {})
+    except Exception as e:
+        print(f"[ERROR] Failed to synthesize best plan: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to synthesize best plan: {str(e)}")
+
+
+@app.post("/api/enhanced-prompt-refinement")
+async def enhanced_prompt_refinement(request: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Enhanced prompt refinement pipeline:
+    1. Generate 2-3 different improvement plans
+    2. Compare plans (strengths/weaknesses)
+    3. Synthesize best combined plan
+    4. Generate improved prompt
+    """
+    original_prompt = request.get("originalPrompt", "")
+    num_plans = request.get("numPlans", 3)
+    
+    if not original_prompt:
+        original_prompt = get_current_prompt()
+    
+    if num_plans < 2 or num_plans > 3:
+        num_plans = 3
+    
+    try:
+        # Step 1: Generate multiple plans
+        plans = await generate_multiple_plans(original_prompt, num_plans)
+        
+        # Step 2: Compare plans
+        comparison = await compare_plans(plans)
+        
+        # Step 3: Synthesize best combined plan
+        best_plan = await synthesize_best_plan(original_prompt, plans, comparison)
+        
+        # Save refinement session
+        session_id = f"enhanced-refinement-{int(time.time() * 1000)}"
+        session_data = {
+            "session_id": session_id,
+            "timestamp": datetime.now().isoformat(),
+            "original_prompt": original_prompt,
+            "plans": plans,
+            "comparison": comparison,
+            "best_combined_plan": best_plan,
+        }
+        
+        session_file = PROMPT_REFINEMENT_DIR / f"{session_id}.json"
+        with open(session_file, "w", encoding="utf-8") as f:
+            json.dump(session_data, f, indent=2, ensure_ascii=False)
+        
+        return {
+            "status": "success",
+            "session_id": session_id,
+            "plans": plans,
+            "comparison": comparison,
+            "best_combined_plan": best_plan,
+            "improved_prompt": best_plan.get("improved_prompt", ""),
+        }
+    except Exception as e:
+        print(f"[ERROR] Enhanced prompt refinement failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Enhanced prompt refinement failed: {str(e)}")
 
 
 # ============================================================================
