@@ -186,15 +186,15 @@ Backend API will be available at `http://localhost:8000`
 5. **Monitor Progress**: Watch real-time progress as pages are analyzed
 6. **View Results**: See final scores, breakdown, and detailed feedback
 
-### For TAs: Reviewer Mode (Human-in-the-Loop)
+### For TAs: Issue Reviewer (Human-in-the-Loop)
 
-1. **Navigate to Reviewer Mode**: Go to `/reviewer`
-2. **Select Submission**: Choose a job ID from the dropdown
-3. **Review Pages**: Navigate through pages using arrow keys or buttons
-4. **Override Scores**: Edit any score component and add comments
-5. **Report AI Errors**: Use "Report AI Error" to document inaccuracies
-6. **Add Risk Flags**: Flag pages that need special attention
-7. **Improve Prompt**: Generate improved prompts based on corrections
+1. **Navigate to Issue Reviewer**: Go to `/issue-reviewer`
+2. **Select Submission**: Pick a job ID (auto-fills from your latest upload)
+3. **Review Issues**: Inspect aggregated issues + contributing pages/screenshots
+4. **Add Rubric Comments**: Use the dropdown to log rubric feedback that feeds the next grading run
+5. **Adjust Scores**: Override issue-level rationale or component scores when needed
+6. **Re-run Grading**: Click “Run AI Grading” to regenerate Stage-2 scores with your comments
+7. **Generate Prompt Analysis**: Produce a summary/draft prompt before deciding to update `grading_prompt.txt`
 
 ### For Instructors: Prompt Refinement
 
@@ -215,10 +215,9 @@ cogs187a_A3b_autograder/
 │   ├── pages/
 │   │   ├── HomePage.tsx
 │   │   ├── UploadPage.tsx      # Main grading interface
-│   │   ├── ReviewerModePage.tsx # HITL review pipeline
+│   │   ├── IssueReviewerPage.tsx # HITL issue-level review UI
 │   │   ├── PromptRefinementPage.tsx # AI-to-AI critique
-│   │   ├── JulianPagesPage.tsx  # Reference site viewer
-│   │   └── LLMRecommendationsPage.tsx
+│   │   └── JulianPagesPage.tsx  # Reference site viewer
 │   └── lib/
 │       └── types.ts            # TypeScript type definitions
 ├── scripts/                    # Utility scripts

@@ -1,42 +1,185 @@
-import React, { useState, useMemo, useEffect } from "react";
-import type { HeuristicExtractionResult, PageAnalysisResult, AssignmentSummary, SummaryScores } from "../lib/types";
+import React, { useState, useMemo, useEffect, useRef } from "react";
+import { useNavigate } from "react-router-dom";
+import type { 
+  HeuristicExtractionResult, 
+  PageAnalysisResult, 
+  AssignmentSummary, 
+  SummaryScores,
+  PageAnalysis,
+  HeuristicFragment,
+  PageRole,
+  RubricLevel
+} from "../lib/types";
 
-// Types for Julian website analysis
-interface HeuristicIssue {
-  id: string;
-  heuristic_number: number;
-  heuristic_name: string;
-  severity: number;
-  severity_label: string;
-  title: string;
-  description: string;
-  bbox?: {
-    x: number;
-    y: number;
-    width: number;
-    height: number;
-  };
-}
-
-interface JulianAnalysisData {
-  overall_score?: number;
-  issues: HeuristicIssue[];
-  url?: string;
-  image_path?: string;
-  third_party_embeds?: string[];
-  has_third_party_embeds?: boolean;
-}
-
-interface JulianPageMeta {
-  id: string;
-  title: string;
-  url?: string;
-}
 
 interface HeuristicInfo {
   number: number;
   name: string;
   description: string;
+}
+
+// Component to display structured page analysis
+function StructuredAnalysisDisplay({ analysis }: { analysis: PageAnalysis }) {
+  const roleLabels: Record<PageRole, string> = {
+    intro: "Introduction",
+    group_collab: "Group Collaboration",
+    heuristic_explainer: "Heuristic Explainer",
+    violation_detail: "Violation Detail",
+    severity_summary: "Severity Summary",
+    conclusion: "Conclusion",
+    ai_opportunities: "AI Opportunities",
+    other: "Other",
+  };
+
+  const levelColors: Record<RubricLevel, string> = {
+    none: "bg-slate-100 text-slate-600",
+    low: "bg-blue-100 text-blue-700",
+    med: "bg-amber-100 text-amber-700",
+    high: "bg-green-100 text-green-700",
+  };
+
+  return (
+    <div className="space-y-3">
+      <div className="flex items-start justify-between">
+        <div>
+          <h3 className="text-sm font-semibold text-emerald-900 mb-1">
+            Structured Analysis
+          </h3>
+          <div className="flex items-center gap-2 flex-wrap mt-1">
+            <span className="text-xs px-2 py-1 rounded-full bg-purple-100 text-purple-800">
+              {roleLabels[analysis.page_role] || analysis.page_role}
+            </span>
+            {analysis.main_heading && (
+              <span className="text-xs text-emerald-700 italic">
+                "{analysis.main_heading}"
+              </span>
+            )}
+            {analysis.has_annotations !== "none" && (
+              <span className="text-xs px-2 py-1 rounded-full bg-blue-100 text-blue-800">
+                Annotations: {analysis.has_annotations}
+              </span>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* Rubric Relevance */}
+      <div className="border-t border-emerald-200 pt-2">
+        <p className="text-xs font-medium text-emerald-900 mb-1">Rubric Relevance:</p>
+        <div className="grid grid-cols-2 gap-1 text-xs">
+          <div className="flex justify-between">
+            <span className="text-emerald-700">Coverage:</span>
+            <span className={`px-1.5 py-0.5 rounded ${levelColors[analysis.rubric_relevance.coverage]}`}>
+              {analysis.rubric_relevance.coverage}
+            </span>
+          </div>
+          <div className="flex justify-between">
+            <span className="text-emerald-700">Violation Quality:</span>
+            <span className={`px-1.5 py-0.5 rounded ${levelColors[analysis.rubric_relevance.violation_quality]}`}>
+              {analysis.rubric_relevance.violation_quality}
+            </span>
+          </div>
+          <div className="flex justify-between">
+            <span className="text-emerald-700">Severity Analysis:</span>
+            <span className={`px-1.5 py-0.5 rounded ${levelColors[analysis.rubric_relevance.severity_analysis]}`}>
+              {analysis.rubric_relevance.severity_analysis}
+            </span>
+          </div>
+          <div className="flex justify-between">
+            <span className="text-emerald-700">Screenshots & Evidence:</span>
+            <span className={`px-1.5 py-0.5 rounded ${levelColors[analysis.rubric_relevance.screenshots_evidence]}`}>
+              {analysis.rubric_relevance.screenshots_evidence}
+            </span>
+          </div>
+          <div className="flex justify-between col-span-2">
+            <span className="text-emerald-700">Group Integration:</span>
+            <span className={`px-1.5 py-0.5 rounded ${levelColors[analysis.rubric_relevance.group_integration]}`}>
+              {analysis.rubric_relevance.group_integration}
+            </span>
+          </div>
+        </div>
+      </div>
+
+      {/* Fragments */}
+      {analysis.fragments && analysis.fragments.length > 0 && (
+        <div className="border-t border-emerald-200 pt-2">
+          <p className="text-xs font-medium text-emerald-900 mb-1">
+            Heuristic Fragments ({analysis.fragments.length}):
+          </p>
+          <div className="space-y-2 max-h-48 overflow-y-auto">
+            {analysis.fragments.map((frag, idx) => (
+              <div key={idx} className="text-xs bg-white rounded border border-emerald-200 p-2">
+                <div className="flex items-center gap-2 mb-1">
+                  <span className="font-semibold text-emerald-900">{frag.heuristic_id}</span>
+                  <span className="text-emerald-600 italic">{frag.issue_key}</span>
+                  {frag.severity_hint && (
+                    <span className="px-1.5 py-0.5 rounded bg-amber-100 text-amber-800 text-xs">
+                      {frag.severity_hint}
+                    </span>
+                  )}
+                </div>
+                <p className="text-emerald-700 mb-1">{frag.text_summary}</p>
+                {frag.fragment_role && frag.fragment_role.length > 0 && (
+                  <div className="flex flex-wrap gap-1 mt-1">
+                    {frag.fragment_role.map((role, rIdx) => (
+                      <span key={rIdx} className="text-xs px-1.5 py-0.5 rounded bg-slate-100 text-slate-700">
+                        {role.replace("_", " ")}
+                      </span>
+                    ))}
+                  </div>
+                )}
+                {frag.rubric_tags && frag.rubric_tags.length > 0 && (
+                  <div className="flex flex-wrap gap-1 mt-1">
+                    {frag.rubric_tags.map((tag, tIdx) => (
+                      <span key={tIdx} className="text-xs px-1.5 py-0.5 rounded bg-blue-100 text-blue-700">
+                        {tag}
+                      </span>
+                    ))}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Severity Summary */}
+      {analysis.severity_summary && (
+        <div className="border-t border-emerald-200 pt-2">
+          <p className="text-xs font-medium text-emerald-900 mb-1">Severity Summary:</p>
+          <div className="text-xs bg-white rounded border border-emerald-200 p-2 space-y-1">
+            <div className="flex justify-between">
+              <span className="text-emerald-700">Visualization:</span>
+              <span className="font-medium">{analysis.severity_summary.visualization}</span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-emerald-700">Coverage Scope:</span>
+              <span className="font-medium">{analysis.severity_summary.coverage_scope}</span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-emerald-700">Mapping Clarity:</span>
+              <span className={`font-medium ${
+                analysis.severity_summary.mapping_clarity === "clear" ? "text-green-700" :
+                analysis.severity_summary.mapping_clarity === "somewhat_clear" ? "text-amber-700" :
+                "text-red-700"
+              }`}>
+                {analysis.severity_summary.mapping_clarity}
+              </span>
+            </div>
+            {analysis.severity_summary.llm_note && (
+              <p className="text-emerald-600 italic mt-1">{analysis.severity_summary.llm_note}</p>
+            )}
+          </div>
+        </div>
+      )}
+
+      {analysis.fragments.length === 0 && !analysis.severity_summary && (
+        <p className="text-xs text-emerald-600 italic">
+          No specific heuristic violations or issues identified on this page.
+        </p>
+      )}
+    </div>
+  );
 }
 
 export default function UploadPage() {
@@ -47,27 +190,15 @@ export default function UploadPage() {
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<HeuristicExtractionResult | null>(null);
   const [analysisResults, setAnalysisResults] = useState<PageAnalysisResult[] | null>(null);
-  const [julianPages, setJulianPages] = useState<JulianPageMeta[]>([]);
-  const [compareAllJulianPages, setCompareAllJulianPages] = useState<boolean>(false);
-  const [allJulianAnalyses, setAllJulianAnalyses] = useState<Map<string, JulianAnalysisData>>(new Map());
-  const [comparisonResults, setComparisonResults] = useState<Array<{
-    julianPageId: string;
-    julianPageTitle: string;
-    julianScore?: number;
-    julianIssues: HeuristicIssue[];
-    studentFeedback?: string;
-    studentHeuristics: number[];
-    studentViolations: number;
-    similarityScore?: number;
-    matchedIssues: Array<{ julian: HeuristicIssue; student: string }>;
-  }>>([]);
-  const [comparisonLoading, setComparisonLoading] = useState<boolean>(false);
   const [heuristicsInfo, setHeuristicsInfo] = useState<HeuristicInfo[]>([]);
   const [previousSubmissions, setPreviousSubmissions] = useState<Array<{
     jobId: string;
     fileName?: string;
     createdAt?: string;
     hasAnalysis?: boolean;
+    hasOverrides?: boolean;
+    hasFinalGrade?: boolean;
+    status?: "ai_graded" | "ta_reviewed" | "final_graded";
   }>>([]);
   const [loadingPrevious, setLoadingPrevious] = useState(false);
   const [duplicateFile, setDuplicateFile] = useState<{
@@ -89,6 +220,9 @@ export default function UploadPage() {
   const [batchProcessing, setBatchProcessing] = useState(false);
   const [batchPaused, setBatchPaused] = useState(false);
   const [batchSize, setBatchSize] = useState(1); // Process 1 at a time by default
+  const [showReviewerModeModal, setShowReviewerModeModal] = useState(false);
+  const navigate = useNavigate();
+  const prevAnalyzingRef = useRef(false);
 
   // Load heuristics info from rubric
   useEffect(() => {
@@ -118,18 +252,62 @@ export default function UploadPage() {
           const data = await res.json();
           const jobs = data.jobs || [];
           
-          // Check which jobs have analysis results
+          // Check which jobs have analysis results, overrides, and final grades
           const jobsWithAnalysis = await Promise.all(
             jobs.map(async (job: any) => {
               try {
                 const analysisRes = await fetch(`http://localhost:8000/api/get-analysis-results?jobId=${job.jobId}`);
                 const hasAnalysis = analysisRes.ok && (await analysisRes.json()).results?.length > 0;
+                
+                // Check for overrides (TA review)
+                let hasOverrides = false;
+                try {
+                  const overridesRes = await fetch(`http://localhost:8000/api/get-overrides?jobId=${job.jobId}`);
+                  if (overridesRes.ok) {
+                    const overridesData = await overridesRes.json();
+                    hasOverrides = overridesData.overrides && overridesData.overrides.length > 0;
+                  }
+                } catch {
+                  // Ignore errors
+                }
+                
+                // Check for final grade (final graded)
+                let hasFinalGrade = false;
+                try {
+                  const finalGradeRes = await fetch(`http://localhost:8000/api/get-final-grade?jobId=${job.jobId}`);
+                  if (finalGradeRes.ok) {
+                    const finalGradeData = await finalGradeRes.json();
+                    hasFinalGrade = finalGradeData.finalGrade !== undefined && finalGradeData.finalGrade !== null;
+                  }
+                } catch {
+                  // Ignore errors
+                }
+                
+                // Determine status
+                let status: "ai_graded" | "ta_reviewed" | "final_graded" = "ai_graded";
+                if (hasFinalGrade) {
+                  status = "final_graded";
+                } else if (hasOverrides) {
+                  status = "ta_reviewed";
+                } else if (hasAnalysis) {
+                  status = "ai_graded";
+                }
+                
                 return {
                   ...job,
                   hasAnalysis,
+                  hasOverrides,
+                  hasFinalGrade,
+                  status,
                 };
               } catch {
-                return { ...job, hasAnalysis: false };
+                return { 
+                  ...job, 
+                  hasAnalysis: false,
+                  hasOverrides: false,
+                  hasFinalGrade: false,
+                  status: "ai_graded" as const,
+                };
               }
             })
           );
@@ -155,255 +333,6 @@ export default function UploadPage() {
     loadPreviousSubmissions();
   }, []);
 
-  // Load Julian pages index on mount
-  useEffect(() => {
-    async function loadJulianPages() {
-      try {
-        const res = await fetch("/output_static/pages_index.json");
-        if (res.ok) {
-          const data = await res.json();
-          const parsed: JulianPageMeta[] = data.map((item: any) => {
-            const idStr = String(item.id).padStart(3, "0");
-            const url = item.url || "";
-            const urlPath = new URL(url).pathname.replace(/^\//, "").replace(/\/$/, "") || "index";
-            const title = urlPath.split("/").pop()?.replace(/-/g, " ") || "Home";
-            const titleCapitalized = title.split(" ").map((word: string) => 
-              word.charAt(0).toUpperCase() + word.slice(1)
-            ).join(" ");
-            return {
-              id: idStr,
-              title: titleCapitalized,
-              url: url,
-            };
-          });
-          setJulianPages(parsed);
-        }
-      } catch (err) {
-        console.error("Failed to load Julian pages:", err);
-      }
-    }
-    loadJulianPages();
-  }, []);
-
-
-  // Load all Julian analyses when compareAllJulianPages is enabled
-  useEffect(() => {
-    async function loadAllJulianAnalyses() {
-      if (!compareAllJulianPages || julianPages.length === 0) {
-        setAllJulianAnalyses(new Map());
-        return;
-      }
-
-      setComparisonLoading(true);
-      const analysesMap = new Map<string, JulianAnalysisData>();
-      
-      try {
-        const loadPromises = julianPages.map(async (page) => {
-          try {
-            const res = await fetch(`/output_static/desktop/analysis/${page.id}.json`);
-            if (res.ok) {
-              const data = await res.json();
-              analysesMap.set(page.id, data);
-            }
-          } catch (err) {
-            console.error(`Failed to load analysis for page ${page.id}:`, err);
-          }
-        });
-
-        await Promise.all(loadPromises);
-        setAllJulianAnalyses(analysesMap);
-      } catch (err) {
-        console.error("Failed to load all Julian analyses:", err);
-      } finally {
-        setComparisonLoading(false);
-      }
-    }
-
-    loadAllJulianAnalyses();
-  }, [compareAllJulianPages, julianPages]);
-
-  // Compare student analysis with all Julian analyses
-  useEffect(() => {
-    if (!compareAllJulianPages || allJulianAnalyses.size === 0 || !analysisResults) {
-      setComparisonResults([]);
-      return;
-    }
-
-    const results: typeof comparisonResults = [];
-
-    // Extract student violations with heuristics and severity
-    interface StudentViolation {
-      heuristic: number;
-      description: string;
-      severity?: string; // "Cosmetic", "Minor", "Major", "Critical" or "1", "2", "3", "4"
-      pageNumber: number;
-    }
-
-    const extractStudentViolations = (feedback: string, pageNumber: number): StudentViolation[] => {
-      const violations: StudentViolation[] = [];
-      const text = feedback.toLowerCase();
-      
-      // Try to extract violations with heuristic and severity
-      // Pattern: "Heuristic X ... violation ... severity: Y"
-      const heuristicMatches = Array.from(feedback.matchAll(/heuristic\s+(\d+)/gi));
-      
-      heuristicMatches.forEach((heuristicMatch) => {
-        const heuristicNum = parseInt(heuristicMatch[1], 10);
-        const matchIndex = heuristicMatch.index || 0;
-        
-        // Find the text after this heuristic mention (next 200 chars)
-        const context = feedback.substring(matchIndex, matchIndex + 300);
-        
-        // Try to extract severity
-        let severity: string | undefined;
-        const severityMatch = context.match(/severity[:\s]+(cosmetic|minor|major|critical|\d)/i);
-        if (severityMatch) {
-          severity = severityMatch[1];
-        }
-        
-        // Extract violation description (text between heuristic and severity, or next sentence)
-        const descMatch = context.match(/heuristic\s+\d+[^.]*?([^.]{10,100}?)(?:severity|$)/i);
-        if (descMatch || context.length > 20) {
-          const description = descMatch ? descMatch[1].trim() : context.substring(20, 100).trim();
-          if (description.length > 5) {
-            violations.push({
-              heuristic: heuristicNum,
-              description: description,
-              severity: severity,
-              pageNumber: pageNumber,
-            });
-          }
-        }
-      });
-      
-      return violations;
-    };
-
-    // Collect all student violations from all pages
-    const allStudentViolations: StudentViolation[] = [];
-    const allStudentAnalyses = analysisResults.filter(a => !a.skip_analysis && a.feedback);
-    
-    allStudentAnalyses.forEach(analysis => {
-      if (analysis.feedback) {
-        const violations = extractStudentViolations(analysis.feedback, analysis.page_number);
-        allStudentViolations.push(...violations);
-      }
-    });
-
-    if (allStudentViolations.length === 0) return;
-
-    // Group violations by heuristic
-    const violationsByHeuristic = new Map<number, StudentViolation[]>();
-    allStudentViolations.forEach(v => {
-      if (!violationsByHeuristic.has(v.heuristic)) {
-        violationsByHeuristic.set(v.heuristic, []);
-      }
-      violationsByHeuristic.get(v.heuristic)!.push(v);
-    });
-
-    julianPages.forEach((julianPage) => {
-      const julianAnalysis = allJulianAnalyses.get(julianPage.id);
-      if (!julianAnalysis) return;
-
-      // Match student violations with Julian issues
-      const matchedIssues: Array<{ 
-        julian: HeuristicIssue; 
-        student: StudentViolation;
-        matchScore: number; // 0-100 based on heuristic match + severity match + text similarity
-      }> = [];
-      
-      julianAnalysis.issues.forEach((julianIssue) => {
-        // Find student violations with same heuristic
-        const studentViolations = violationsByHeuristic.get(julianIssue.heuristic_number) || [];
-        
-        studentViolations.forEach((studentViolation) => {
-          let matchScore = 50; // Base score for heuristic match
-          
-          // Check severity match (if both have severity)
-          if (studentViolation.severity && julianIssue.severity) {
-            const studentSeverityNum = studentViolation.severity.match(/\d/) 
-              ? parseInt(studentViolation.severity)
-              : studentViolation.severity.toLowerCase().includes("cosmetic") ? 1
-              : studentViolation.severity.toLowerCase().includes("minor") ? 2
-              : studentViolation.severity.toLowerCase().includes("major") ? 3
-              : studentViolation.severity.toLowerCase().includes("critical") ? 4
-              : undefined;
-            
-            if (studentSeverityNum !== undefined) {
-              const severityDiff = Math.abs(studentSeverityNum - julianIssue.severity);
-              if (severityDiff === 0) {
-                matchScore += 30; // Exact severity match
-              } else if (severityDiff === 1) {
-                matchScore += 15; // Close severity match
-              }
-            }
-          }
-          
-          // Check text similarity
-          const studentText = studentViolation.description.toLowerCase();
-          const julianTitle = julianIssue.title.toLowerCase();
-          const julianDesc = julianIssue.description.toLowerCase();
-          
-          const titleWords = julianTitle.split(/\s+/).filter(w => w.length > 3);
-          const descWords = julianDesc.split(/\s+/).filter(w => w.length > 4).slice(0, 5);
-          
-          const hasSimilarText = titleWords.some(word => studentText.includes(word)) ||
-                                 descWords.some(word => studentText.includes(word)) ||
-                                 studentText.includes(julianTitle.substring(0, 15)) ||
-                                 studentText.includes(julianDesc.substring(0, 30));
-          
-          if (hasSimilarText) {
-            matchScore += 20; // Text similarity bonus
-          }
-          
-          // Only include matches with score >= 50
-          if (matchScore >= 50) {
-            matchedIssues.push({
-              julian: julianIssue,
-              student: studentViolation,
-              matchScore: matchScore,
-            });
-          }
-        });
-      });
-
-      // Calculate overall match metrics
-      const uniqueStudentHeuristics = new Set(allStudentViolations.map(v => v.heuristic));
-      const matchedHeuristics = new Set(matchedIssues.map(m => m.julian.heuristic_number));
-      const heuristicMatchRate = uniqueStudentHeuristics.size > 0
-        ? (matchedHeuristics.size / uniqueStudentHeuristics.size) * 100
-        : 0;
-      
-      // Average match score
-      const avgMatchScore = matchedIssues.length > 0
-        ? matchedIssues.reduce((sum, m) => sum + m.matchScore, 0) / matchedIssues.length
-        : 0;
-
-      results.push({
-        julianPageId: julianPage.id,
-        julianPageTitle: julianPage.title,
-        julianScore: julianAnalysis.overall_score,
-        julianIssues: julianAnalysis.issues,
-        studentFeedback: allStudentAnalyses.map(a => a.feedback || "").join(" ").substring(0, 500),
-        studentHeuristics: Array.from(uniqueStudentHeuristics),
-        studentViolations: allStudentViolations.length,
-        similarityScore: avgMatchScore,
-        matchedIssues: matchedIssues.map(m => ({
-          julian: m.julian,
-          student: `Page ${m.student.pageNumber}: H${m.student.heuristic} - ${m.student.description}${m.student.severity ? ` (${m.student.severity})` : ""}`,
-        })),
-      });
-    });
-
-    // Sort by average match score (highest first), then by number of matches
-    results.sort((a, b) => {
-      if (Math.abs((b.similarityScore || 0) - (a.similarityScore || 0)) > 5) {
-        return (b.similarityScore || 0) - (a.similarityScore || 0);
-      }
-      return b.matchedIssues.length - a.matchedIssues.length;
-    });
-    setComparisonResults(results);
-  }, [compareAllJulianPages, allJulianAnalyses, analysisResults, julianPages]);
 
   const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     if (batchMode) {
@@ -726,7 +655,15 @@ export default function UploadPage() {
 
     if (choice === "load") {
       await loadPreviousSubmission(duplicateFile.jobId);
+      // After loading an existing submission, immediately navigate to Reviewer Mode for that job
       setDuplicateFile(null);
+      if (duplicateFile.jobId) {
+        localStorage.setItem(
+          "recentJobIds",
+          JSON.stringify([{ jobId: duplicateFile.jobId, fileName: duplicateFile.fileName }]),
+        );
+        navigate(`/issue-reviewer?jobId=${duplicateFile.jobId}`);
+      }
     } else if (choice === "delete") {
       if (window.confirm(`Are you sure you want to delete "${duplicateFile.fileName}"? This action cannot be undone.`)) {
         await deleteSubmission(duplicateFile.jobId);
@@ -781,6 +718,8 @@ export default function UploadPage() {
       };
 
       setResult(extractionResult);
+      // Clear any previous analysis results when uploading a new file
+      setAnalysisResults(null);
     } catch (err: any) {
       let errorMessage = err.message || "Something went wrong while parsing the PDF.";
       
@@ -791,6 +730,144 @@ export default function UploadPage() {
       setError(errorMessage);
     } finally {
       setLoading(false);
+    }
+  };
+
+  const handleRerunAnalysis = async () => {
+    // Clear previous analysis results and rerun
+    setAnalysisResults([]);
+    setError(null);
+    await handleAnalyze();
+  };
+
+  // Get missing pages that need analysis
+  const getMissingPages = useMemo(() => {
+    if (!result || !analysisResults) return [];
+    const extractedPageNumbers = new Set(result.pages.map(p => p.pageNumber));
+    const analyzedPageNumbers = new Set(
+      analysisResults
+        .filter(a => !a.skip_analysis)
+        .map(a => a.page_number)
+    );
+    const missingPageNumbers = Array.from(extractedPageNumbers).filter(
+      pn => !analyzedPageNumbers.has(pn)
+    );
+    return result.pages.filter(p => missingPageNumbers.includes(p.pageNumber));
+  }, [result, analysisResults]);
+
+  // Analyze only missing pages
+  const handleAnalyzeMissingPages = async () => {
+    const missingPages = getMissingPages;
+    if (missingPages.length === 0) {
+      setError("No missing pages to analyze.");
+      return;
+    }
+
+    if (!result) {
+      setError("No extraction result found.");
+      return;
+    }
+
+    setAnalyzing(true);
+    setError(null);
+    setAnalyzingProgress({ current: 0, total: missingPages.length });
+
+    const newResults: PageAnalysisResult[] = [];
+    const existingResults = analysisResults || [];
+
+    try {
+      // Analyze missing pages with limited concurrency (2 at a time)
+      const concurrency = 2;
+      
+      for (let i = 0; i < missingPages.length; i += concurrency) {
+        const batch = missingPages.slice(i, i + concurrency);
+        
+        // Process batch concurrently
+        const batchPromises = batch.map(async (page) => {
+          try {
+            const res = await fetch("http://localhost:8000/api/analyze-single-page", {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+              },
+              body: JSON.stringify({
+                page: page,
+                jobId: result.jobId,
+              }),
+            });
+
+            if (!res.ok) {
+              const data = await res.json().catch(() => null);
+              const msg = data?.detail || `Request failed with status ${res.status}`;
+              const errorStr = msg.toLowerCase();
+              if (errorStr.includes("quota") || errorStr.includes("rate limit") || errorStr.includes("resource_exhausted") || 
+                  errorStr.includes("429") || errorStr.includes("token") || errorStr.includes("billing") ||
+                  errorStr.includes("api key") || errorStr.includes("authentication")) {
+                setError(`⚠️ API Error (Page ${page.pageNumber}): ${msg}`);
+              }
+              throw new Error(msg);
+            }
+
+            const data = await res.json();
+            if (data.status === "completed" && data.result) {
+              if (data.result.error) {
+                const errorStr = data.result.error.toLowerCase();
+                if (errorStr.includes("quota") || errorStr.includes("rate limit") || errorStr.includes("resource_exhausted") || 
+                    errorStr.includes("429") || errorStr.includes("token") || errorStr.includes("billing") ||
+                    errorStr.includes("api key") || errorStr.includes("authentication")) {
+                  setError(`⚠️ API Error (Page ${page.pageNumber}): ${data.result.error}`);
+                }
+              }
+              return data.result;
+            } else if (data.status === "error") {
+              const errorStr = (data.result?.error || data.detail || "").toLowerCase();
+              if (errorStr.includes("quota") || errorStr.includes("rate limit") || errorStr.includes("resource_exhausted") || 
+                  errorStr.includes("429") || errorStr.includes("token") || errorStr.includes("billing") ||
+                  errorStr.includes("api key") || errorStr.includes("authentication")) {
+                setError(`⚠️ API Error (Page ${page.pageNumber}): ${data.result?.error || data.detail || "Token/quota issue"}`);
+              }
+              return data.result;
+            }
+            throw new Error("Unknown response status");
+          } catch (err: any) {
+            let errorMsg = err.message || "Failed to analyze this page";
+            if (err.message?.includes("Failed to fetch") || err.message?.includes("NetworkError") || err.name === "TypeError") {
+              errorMsg = "Cannot connect to backend server. Please ensure the backend is running.";
+            }
+            
+            const errorStr = err.message?.toLowerCase() || "";
+            if (errorStr.includes("quota") || errorStr.includes("rate limit") || errorStr.includes("resource_exhausted") || 
+                errorStr.includes("429") || errorStr.includes("token") || errorStr.includes("billing") ||
+                errorStr.includes("api key") || errorStr.includes("authentication")) {
+              errorMsg = `API Error: ${err.message || "Token quota exhausted or API key issue. Please check your API key and billing status."}`;
+              setError(`⚠️ API Error (Page ${page.pageNumber}): ${errorMsg}`);
+            }
+            
+            return {
+              page_number: page.pageNumber,
+              error: errorMsg,
+              feedback: `Error analyzing page ${page.pageNumber}: ${errorMsg}`,
+            };
+          }
+        });
+
+        const batchResults = await Promise.all(batchPromises);
+        newResults.push(...batchResults);
+        
+        setAnalyzingProgress({ 
+          current: Math.min(i + concurrency, missingPages.length), 
+          total: missingPages.length 
+        });
+        setAnalysisResults([...existingResults, ...newResults]);
+      }
+
+      // Merge with existing results
+      setAnalysisResults([...existingResults, ...newResults]);
+    } catch (err: any) {
+      setError(`Failed to analyze missing pages: ${err.message || "Unknown error"}`);
+    } finally {
+      setAnalyzing(false);
+      setAnalyzingProgress({ current: 0, total: 0 });
     }
   };
 
@@ -832,13 +909,36 @@ export default function UploadPage() {
             if (!res.ok) {
               const data = await res.json().catch(() => null);
               const msg = data?.detail || `Request failed with status ${res.status}`;
+              // Check for token/quota errors
+              const errorStr = msg.toLowerCase();
+              if (errorStr.includes("quota") || errorStr.includes("rate limit") || errorStr.includes("resource_exhausted") || 
+                  errorStr.includes("429") || errorStr.includes("token") || errorStr.includes("billing") ||
+                  errorStr.includes("api key") || errorStr.includes("authentication")) {
+                setError(`⚠️ API Error (Page ${page.pageNumber}): ${msg}`);
+              }
               throw new Error(msg);
             }
 
             const data = await res.json();
             if (data.status === "completed" && data.result) {
+              // Check if result contains error related to tokens/quota
+              if (data.result.error) {
+                const errorStr = data.result.error.toLowerCase();
+                if (errorStr.includes("quota") || errorStr.includes("rate limit") || errorStr.includes("resource_exhausted") || 
+                    errorStr.includes("429") || errorStr.includes("token") || errorStr.includes("billing") ||
+                    errorStr.includes("api key") || errorStr.includes("authentication")) {
+                  setError(`⚠️ API Error (Page ${page.pageNumber}): ${data.result.error}`);
+                }
+              }
               return data.result;
             } else if (data.status === "error") {
+              // Check for token/quota errors in error response
+              const errorStr = (data.result?.error || data.detail || "").toLowerCase();
+              if (errorStr.includes("quota") || errorStr.includes("rate limit") || errorStr.includes("resource_exhausted") || 
+                  errorStr.includes("429") || errorStr.includes("token") || errorStr.includes("billing") ||
+                  errorStr.includes("api key") || errorStr.includes("authentication")) {
+                setError(`⚠️ API Error (Page ${page.pageNumber}): ${data.result?.error || data.detail || "Token/quota issue"}`);
+              }
               return data.result;
             }
             throw new Error("Unknown response status");
@@ -847,6 +947,16 @@ export default function UploadPage() {
             let errorMsg = err.message || "Failed to analyze this page";
             if (err.message?.includes("Failed to fetch") || err.message?.includes("NetworkError") || err.name === "TypeError") {
               errorMsg = "Cannot connect to backend server. Please ensure the backend is running.";
+            }
+            
+            // Check for token/quota errors
+            const errorStr = err.message?.toLowerCase() || "";
+            if (errorStr.includes("quota") || errorStr.includes("rate limit") || errorStr.includes("resource_exhausted") || 
+                errorStr.includes("429") || errorStr.includes("token") || errorStr.includes("billing") ||
+                errorStr.includes("api key") || errorStr.includes("authentication")) {
+              errorMsg = `API Error: ${err.message || "Token quota exhausted or API key issue. Please check your API key and billing status."}`;
+              // Set global error to display prominently
+              setError(`⚠️ API Error (Page ${page.pageNumber}): ${errorMsg}`);
             }
             
             // Return error result
@@ -880,6 +990,18 @@ export default function UploadPage() {
       setAnalyzingProgress(null);
     }
   };
+
+  // Track when analysis completes to show modal
+  useEffect(() => {
+    // Show modal when analysis transitions from analyzing to complete
+    if (prevAnalyzingRef.current && !analyzing && analysisResults && analysisResults.length > 0 && !showReviewerModeModal) {
+      // Small delay to ensure UI has updated
+      setTimeout(() => {
+        setShowReviewerModeModal(true);
+      }, 500);
+    }
+    prevAnalyzingRef.current = analyzing;
+  }, [analyzing, analysisResults, showReviewerModeModal]);
 
   // Calculate summary scores from all analyzed pages
   const assignmentSummary = useMemo((): AssignmentSummary | null => {
@@ -1126,6 +1248,22 @@ export default function UploadPage() {
     };
   }, [analysisResults]);
 
+  // Navigate to issue reviewer mode
+  const handleGoToReviewerMode = () => {
+    if (result?.jobId) {
+      // Store jobId in localStorage for reviewer mode
+      localStorage.setItem("recentJobIds", JSON.stringify([{ jobId: result.jobId, fileName: result.fileName }]));
+      navigate(`/issue-reviewer?jobId=${result.jobId}`);
+    }
+  };
+
+  // Check if analysis is complete (all extracted pages have been analyzed)
+  const isAnalysisComplete =
+    !analyzing &&
+    analysisResults &&
+    analysisResults.length > 0 &&
+    getMissingPages.length === 0;
+
   return (
     <div className="min-h-screen bg-slate-50 flex flex-col items-center px-4 py-8">
       <div className="w-full max-w-7xl bg-white shadow rounded-2xl p-6 space-y-6">
@@ -1191,66 +1329,108 @@ export default function UploadPage() {
             <h2 className="text-sm font-semibold text-slate-700 mb-3">
               Previous Submissions
             </h2>
-            <div className="space-y-2 max-h-48 overflow-y-auto">
-              {previousSubmissions.map((submission) => (
-                <div
-                  key={submission.jobId}
-                  className="flex items-center justify-between p-2 bg-white rounded border border-slate-200 hover:border-slate-300"
-                >
-                  <div className="flex-1 min-w-0">
-                    <div className="flex items-center gap-2">
-                      <span className="text-sm font-medium text-slate-900 truncate">
-                        {submission.fileName || submission.jobId}
+            <div className="space-y-2 max-h-64 overflow-y-auto">
+              {previousSubmissions.map((submission) => {
+                const getStatusBadge = () => {
+                  if (submission.status === "final_graded") {
+                    return (
+                      <span className="text-xs bg-purple-100 text-purple-800 px-2 py-0.5 rounded font-medium">
+                        Final Graded
                       </span>
-                      {submission.hasAnalysis ? (
-                        <span className="text-xs bg-green-100 text-green-800 px-2 py-0.5 rounded">
-                          Graded
+                    );
+                  } else if (submission.status === "ta_reviewed") {
+                    return (
+                      <span className="text-xs bg-blue-100 text-blue-800 px-2 py-0.5 rounded font-medium">
+                        TA Reviewed
+                      </span>
+                    );
+                  } else if (submission.status === "ai_graded" && submission.hasAnalysis) {
+                    return (
+                      <span className="text-xs bg-green-100 text-green-800 px-2 py-0.5 rounded font-medium">
+                        AI extracted
+                      </span>
+                    );
+                  } else {
+                    return (
+                      <span className="text-xs bg-amber-100 text-amber-800 px-2 py-0.5 rounded font-medium">
+                        Not Graded
+                      </span>
+                    );
+                  }
+                };
+
+                return (
+                  <div
+                    key={submission.jobId}
+                    className="flex items-center justify-between p-3 bg-white rounded border border-slate-200 hover:border-slate-300 transition-colors"
+                  >
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <span className="text-sm font-medium text-slate-900 truncate">
+                          {submission.fileName || submission.jobId}
                         </span>
-                      ) : (
-                        <span className="text-xs bg-amber-100 text-amber-800 px-2 py-0.5 rounded">
-                          Not Graded
-                        </span>
+                        {getStatusBadge()}
+                      </div>
+                      {submission.createdAt && (
+                        <p className="text-xs text-slate-500 mt-1">
+                          {new Date(submission.createdAt).toLocaleString()}
+                        </p>
                       )}
                     </div>
-                    {submission.createdAt && (
-                      <p className="text-xs text-slate-500 mt-0.5">
-                        {new Date(submission.createdAt).toLocaleString()}
-                      </p>
-                    )}
+                    <div className="flex items-center gap-2 ml-3 flex-shrink-0">
+                      {submission.status === "final_graded" && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            navigate(`/final-detail?jobId=${submission.jobId}`);
+                          }}
+                          className="px-3 py-1.5 text-sm bg-purple-600 text-white rounded-md hover:bg-purple-700"
+                          title="View final grade details"
+                        >
+                          View Details
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        onClick={async () => {
+                          await loadPreviousSubmission(submission.jobId);
+                          // After loading a previous submission from the list, jump directly to Reviewer Mode
+                          localStorage.setItem(
+                            "recentJobIds",
+                            JSON.stringify([{ jobId: submission.jobId, fileName: submission.fileName }]),
+                          );
+                          navigate(`/issue-reviewer?jobId=${submission.jobId}`);
+                        }}
+                        disabled={loading}
+                        className="px-3 py-1.5 text-sm bg-sky-600 text-white rounded-md hover:bg-sky-700 disabled:opacity-50 disabled:cursor-not-allowed"
+                      >
+                        {loading ? "Loading..." : "Load"}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          if (window.confirm(`Are you sure you want to delete "${submission.fileName || submission.jobId}"? This action cannot be undone.`)) {
+                            deleteSubmission(submission.jobId);
+                          }
+                        }}
+                        className="px-2 py-1.5 text-sm bg-red-600 text-white rounded-md hover:bg-red-700"
+                        title="Delete submission"
+                      >
+                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                        </svg>
+                      </button>
+                    </div>
                   </div>
-                  <div className="flex items-center gap-2 ml-3">
-                    <button
-                      type="button"
-                      onClick={() => loadPreviousSubmission(submission.jobId)}
-                      disabled={loading}
-                      className="px-3 py-1.5 text-sm bg-sky-600 text-white rounded-md hover:bg-sky-700 disabled:opacity-50 disabled:cursor-not-allowed"
-                    >
-                      {loading ? "Loading..." : "Load"}
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        if (window.confirm(`Are you sure you want to delete "${submission.fileName || submission.jobId}"? This action cannot be undone.`)) {
-                          deleteSubmission(submission.jobId);
-                        }
-                      }}
-                      className="px-2 py-1.5 text-sm bg-red-600 text-white rounded-md hover:bg-red-700"
-                      title="Delete submission"
-                    >
-                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
-                      </svg>
-                    </button>
-                  </div>
-                </div>
-              ))}
+                );
+              })}
             </div>
           </div>
         )}
 
         {/* Batch Mode Toggle */}
         <div className="flex items-center gap-4 mb-4">
-          <label className="flex items-center gap-2 text-sm text-slate-700">
+          <label className="relative inline-flex items-center cursor-pointer group">
             <input
               type="checkbox"
               checked={batchMode}
@@ -1260,9 +1440,12 @@ export default function UploadPage() {
                   clearBatch();
                 }
               }}
-              className="rounded border-slate-300"
+              className="sr-only peer"
             />
-            <span className="font-medium">Batch Mode</span>
+            <div className="w-11 h-6 bg-slate-300 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-sky-300 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-sky-600"></div>
+            <span className="ml-3 text-sm font-medium text-slate-700 group-hover:text-slate-900">
+              Batch Mode
+            </span>
           </label>
           {batchMode && (
             <div className="flex items-center gap-2 text-sm text-slate-600">
@@ -1492,9 +1675,33 @@ export default function UploadPage() {
           )}
 
           {error && (
-            <p className="text-sm text-red-600 mt-2">
-              {error}
-            </p>
+            <div className="border-2 border-red-300 rounded-lg p-4 bg-red-50 mt-2">
+              <div className="flex items-start gap-3">
+                <div className="flex-shrink-0">
+                  <svg className="w-5 h-5 text-red-600" fill="currentColor" viewBox="0 0 20 20">
+                    <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293z" clipRule="evenodd" />
+                  </svg>
+                </div>
+                <div className="flex-1">
+                  <h3 className="text-sm font-semibold text-red-900 mb-1">
+                    Error
+                  </h3>
+                  <p className="text-sm text-red-800 whitespace-pre-wrap">
+                    {error}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setError(null)}
+                  className="flex-shrink-0 text-red-600 hover:text-red-800"
+                  title="Dismiss error"
+                >
+                  <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                  </svg>
+                </button>
+              </div>
+            </div>
           )}
         </form>
 
@@ -1518,32 +1725,97 @@ export default function UploadPage() {
                   <p className="text-sm text-slate-600">
                     Total pages detected: <span className="font-semibold text-slate-800">{result.pageCount}</span>
                   </p>
+                  {isAnalysisComplete && analysisResults && (
+                    <div className="mt-2">
+                      {(() => {
+                        const extractedPageNumbers = new Set(result.pages.map(p => p.pageNumber));
+                        const analyzedPageNumbers = new Set(
+                          analysisResults
+                            .filter(a => !a.skip_analysis)
+                            .map(a => a.page_number)
+                        );
+                        const missingAnalysis = Array.from(extractedPageNumbers).filter(
+                          pn => !analyzedPageNumbers.has(pn)
+                        );
+                        const extraAnalysis = Array.from(analyzedPageNumbers).filter(
+                          pn => !extractedPageNumbers.has(pn)
+                        );
+                        const isMatch = missingAnalysis.length === 0 && extraAnalysis.length === 0;
+                        
+                        return (
+                          <div className={`text-xs px-2 py-1 rounded ${
+                            isMatch 
+                              ? "bg-green-100 text-green-800" 
+                              : "bg-yellow-100 text-yellow-800"
+                          }`}>
+                            {isMatch ? (
+                              <span>✓ Pages match: {extractedPageNumbers.size} extracted = {analyzedPageNumbers.size} analyzed</span>
+                            ) : (
+                              <div>
+                                <div>⚠ Page mismatch detected:</div>
+                                {missingAnalysis.length > 0 && (
+                                  <div className="mt-1">Missing analysis for pages: {missingAnalysis.sort((a, b) => a - b).join(", ")}</div>
+                                )}
+                                {extraAnalysis.length > 0 && (
+                                  <div className="mt-1">Extra analysis for pages: {extraAnalysis.sort((a, b) => a - b).join(", ")}</div>
+                                )}
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })()}
+                    </div>
+                  )}
+                  {getMissingPages.length > 0 && isAnalysisComplete && (
+                    <div className="mt-2">
+                      <button
+                        type="button"
+                        onClick={handleAnalyzeMissingPages}
+                        disabled={analyzing}
+                        className="inline-flex items-center justify-center rounded-md
+                                   bg-orange-600 px-3 py-1.5 text-xs font-medium text-white
+                                   hover:bg-orange-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                      >
+                        {analyzing ? `Analyzing ${getMissingPages.length} missing pages...` : `Analyze ${getMissingPages.length} Missing Page${getMissingPages.length > 1 ? 's' : ''}`}
+                      </button>
+                    </div>
+                  )}
                 </div>
                 <div className="flex items-center gap-2 flex-wrap">
-                  {julianPages.length > 0 && (
-                    <label className={`flex items-center gap-2 text-sm ${
-                      analyzing || analysisResults ? "text-slate-500" : "text-slate-700"
-                    }`}>
-                      <input
-                        type="checkbox"
-                        checked={compareAllJulianPages}
-                        onChange={(e) => setCompareAllJulianPages(e.target.checked)}
-                        disabled={analyzing || analysisResults !== null}
-                        className="rounded border-slate-300 disabled:opacity-50 disabled:cursor-not-allowed"
-                      />
-                      <span>Compare with Julian Site Analysis</span>
-                    </label>
-                  )}
-                  <button
-                    type="button"
-                    onClick={handleAnalyze}
-                    disabled={analyzing || result.pages.length === 0}
-                    className="inline-flex items-center justify-center rounded-md
-                               bg-emerald-600 px-4 py-2 text-sm font-medium text-white
-                               hover:bg-emerald-700 disabled:opacity-50 disabled:cursor-not-allowed"
-                  >
-                    {analyzing ? "Analyzing with Gemini…" : "Analyze with Gemini"}
-                  </button>
+                  {isAnalysisComplete ? (
+                    <>
+                      <button
+                        type="button"
+                        onClick={handleGoToReviewerMode}
+                        className="inline-flex items-center justify-center rounded-md
+                                   bg-purple-600 px-4 py-2 text-sm font-medium text-white
+                                   hover:bg-purple-700 transition-colors"
+                      >
+                        Go to Reviewer Mode
+                      </button>
+                      <button
+                        type="button"
+                        onClick={handleRerunAnalysis}
+                        disabled={analyzing}
+                        className="inline-flex items-center justify-center rounded-md
+                                   bg-emerald-600 px-4 py-2 text-sm font-medium text-white
+                                   hover:bg-emerald-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                      >
+                        {analyzing ? "Re-analyzing with Gemini…" : "Rerun Analysis with Gemini"}
+                      </button>
+                    </>
+                  ) : result && result.pages.length > 0 ? (
+                    <button
+                      type="button"
+                      onClick={handleAnalyze}
+                      disabled={analyzing}
+                      className="inline-flex items-center justify-center rounded-md
+                                 bg-emerald-600 px-4 py-2 text-sm font-medium text-white
+                                 hover:bg-emerald-700 disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      {analyzing ? "Analyzing with Gemini…" : "Analyze with Gemini"}
+                    </button>
+                  ) : null}
                 </div>
               </div>
             </div>
@@ -1572,483 +1844,180 @@ export default function UploadPage() {
               </div>
             )}
 
-            {/* Comparison Results Section - Overall Summary */}
-            {!analyzing && compareAllJulianPages && comparisonResults.length > 0 && (
-              <div className="rounded-lg border-2 border-blue-300 bg-blue-50 p-6 space-y-4">
-                <h2 className="text-xl font-bold text-blue-900">
-                  Comparison with Julian Site Analysis
-                </h2>
-                {comparisonLoading ? (
-                  <p className="text-sm text-blue-700">Loading comparisons...</p>
-                ) : (
-                  (() => {
-                    // Aggregate all Julian pages data
-                    const totalJulianIssues = comparisonResults.reduce((sum, r) => sum + r.julianIssues.length, 0);
-                    const totalJulianHeuristics = new Set(comparisonResults.flatMap(r => r.julianIssues.map(i => i.heuristic_number))).size;
-                    const avgJulianScore = comparisonResults.reduce((sum, r) => sum + (r.julianScore || 0), 0) / comparisonResults.length;
-                    const totalMatchedIssues = comparisonResults.reduce((sum, r) => sum + r.matchedIssues.length, 0);
-                    const bestMatch = comparisonResults[0]; // Already sorted by match score
-                    const avgMatchScore = comparisonResults.reduce((sum, r) => sum + (r.similarityScore || 0), 0) / comparisonResults.length;
-                    const totalStudentHeuristics = new Set(comparisonResults.flatMap(r => r.studentHeuristics)).size;
-                    const totalStudentViolations = comparisonResults[0]?.studentViolations || 0;
-                    
+            {/* Page-by-page Progress Display */}
+            {result && result.pages.length > 0 && (
+              <div className="rounded-lg border-2 border-slate-300 bg-slate-50 p-6 space-y-4">
+                <div className="flex items-center justify-between">
+                  <h2 className="text-xl font-bold text-slate-900">
+                    Page Analysis Progress
+                  </h2>
+                  {analyzing && analyzingProgress && (
+                    <span className="text-xs text-slate-600">
+                      {analyzingProgress.current} / {analyzingProgress.total} analyzed
+                    </span>
+                  )}
+                </div>
+                <div className="space-y-4 max-h-[600px] overflow-y-auto">
+                  {result.pages.map((page) => {
+                    const analysis = analysisResults?.find(a => a.page_number === page.pageNumber);
+                    const isAnalyzing = analyzing && !analysis;
+                    const hasError = analysis?.error;
                     return (
-                      <div className="space-y-4">
-                        <div className="grid grid-cols-2 gap-4">
-                          <div className="rounded-lg border border-blue-200 bg-white p-4">
-                            <h3 className="text-sm font-semibold text-blue-900 mb-3">Julian Site (Overall)</h3>
-                            <div className="space-y-2 text-xs">
-                              <div className="flex justify-between">
-                                <span className="text-blue-700">Total Pages Analyzed:</span>
-                                <span className="font-medium text-blue-900">{comparisonResults.length}</span>
-                              </div>
-                              <div className="flex justify-between">
-                                <span className="text-blue-700">Total Issues Found:</span>
-                                <span className="font-medium text-blue-900">{totalJulianIssues}</span>
-                              </div>
-                              <div className="flex justify-between">
-                                <span className="text-blue-700">Heuristics Covered:</span>
-                                <span className="font-medium text-blue-900">{totalJulianHeuristics} / 10</span>
-                              </div>
-                              <div className="flex justify-between">
-                                <span className="text-blue-700">Average Score:</span>
-                                <span className="font-medium text-blue-900">{avgJulianScore.toFixed(2)}</span>
-                              </div>
-                            </div>
-                          </div>
-                          <div className="rounded-lg border border-blue-200 bg-white p-4">
-                            <h3 className="text-sm font-semibold text-blue-900 mb-3">Student Submission</h3>
-                            <div className="space-y-2 text-xs">
-                              <div className="flex justify-between">
-                                <span className="text-blue-700">Heuristics Covered:</span>
-                                <span className="font-medium text-blue-900">{totalStudentHeuristics} / 10</span>
-                              </div>
-                              <div className="flex justify-between">
-                                <span className="text-blue-700">Violations Identified:</span>
-                                <span className="font-medium text-blue-900">{totalStudentViolations}</span>
-                              </div>
-                              <div className="flex justify-between">
-                                <span className="text-blue-700">Matched Issues:</span>
-                                <span className="font-medium text-blue-900">{totalMatchedIssues}</span>
-                              </div>
-                              <div className="flex justify-between">
-                                <span className="text-blue-700">Average Match Score:</span>
-                                <span className={`font-medium ${
-                                  avgMatchScore >= 70 ? "text-green-700" : avgMatchScore >= 50 ? "text-yellow-700" : "text-red-700"
-                                }`}>
-                                  {avgMatchScore.toFixed(0)}%
-                                </span>
-                              </div>
-                            </div>
-                          </div>
+                      <div
+                        key={page.pageNumber}
+                        className="rounded-xl border border-slate-200 bg-white p-4"
+                      >
+                        <div className="mb-2 flex items-center justify-between">
+                          <span className="text-sm font-semibold text-slate-800">
+                            Page {page.pageNumber}
+                          </span>
+                          {isAnalyzing ? (
+                            <span className="text-xs px-2 py-1 rounded-full bg-blue-100 text-blue-800">
+                              Analyzing...
+                            </span>
+                          ) : hasError ? (
+                            <span className="text-xs px-2 py-1 rounded-full bg-red-100 text-red-800">
+                              Error
+                            </span>
+                          ) : analysis && (
+                            <span className={`text-xs px-2 py-1 rounded-full ${
+                              analysis.skip_analysis 
+                                ? "bg-slate-100 text-slate-600" 
+                                : "bg-emerald-100 text-emerald-800"
+                            }`}>
+                              {analysis.skip_analysis ? "Skipped" : "Analyzed"}
+                            </span>
+                          )}
                         </div>
-                        {bestMatch && bestMatch.matchedIssues.length > 0 && (
-                          <div className="rounded-lg border border-blue-200 bg-white p-4">
-                            <h3 className="text-sm font-semibold text-blue-900 mb-2">
-                              Best Match: {bestMatch.julianPageTitle} (Match Score: {bestMatch.similarityScore?.toFixed(0)}%)
-                            </h3>
-                            <p className="text-xs text-blue-700 mb-2">
-                              {bestMatch.matchedIssues.length} issues matched out of {bestMatch.julianIssues.length} Julian issues
-                            </p>
-                            <div className="space-y-1 max-h-32 overflow-y-auto">
-                              {bestMatch.matchedIssues.slice(0, 5).map((match, idx) => (
-                                <div key={idx} className="text-xs text-blue-700 border-l-2 border-blue-300 pl-2">
-                                  <span className="font-medium">H{match.julian.heuristic_number}: {match.julian.title}</span>
-                                  <span className="text-blue-600"> ({match.julian.severity_label})</span>
+                        {page.imageBase64 && (
+                          <img
+                            src={page.imageBase64}
+                            alt={`Page ${page.pageNumber}`}
+                            className="mb-3 w-full rounded-lg border border-slate-200 bg-white"
+                          />
+                        )}
+                        {hasError && (
+                          <div className="mt-2 rounded-lg border border-red-200 bg-red-50 p-2">
+                            <div className="text-xs text-red-800 font-medium mb-1">
+                              Error:
+                            </div>
+                            <div className="text-xs text-red-700">
+                              {analysis.error}
+                            </div>
+                          </div>
+                        )}
+                        {analysis && !hasError && !analysis.skip_analysis && (
+                          <div className="mt-2 rounded-lg border border-emerald-200 bg-emerald-50 p-3 space-y-2">
+                            {/* Structured Analysis (new format) */}
+                            {analysis.structured_analysis ? (
+                              <>
+                                <div className="text-xs font-semibold text-emerald-900 mb-2">
+                                  Analysis Results:
                                 </div>
-                              ))}
-                              {bestMatch.matchedIssues.length > 5 && (
-                                <p className="text-xs text-blue-600 italic">
-                                  ... and {bestMatch.matchedIssues.length - 5} more matches
-                                </p>
-                              )}
+                                <div className="space-y-1.5 text-xs">
+                                  <div>
+                                    <span className="font-medium text-emerald-800">Page Role:</span>{" "}
+                                    <span className="text-emerald-700">{analysis.structured_analysis.page_role}</span>
+                                  </div>
+                                  {analysis.structured_analysis.main_heading && (
+                                    <div>
+                                      <span className="font-medium text-emerald-800">Main Heading:</span>{" "}
+                                      <span className="text-emerald-700">{analysis.structured_analysis.main_heading}</span>
+                                    </div>
+                                  )}
+                                  {analysis.structured_analysis.fragments && analysis.structured_analysis.fragments.length > 0 && (
+                                    <div>
+                                      <span className="font-medium text-emerald-800">Heuristic Fragments:</span>{" "}
+                                      <span className="text-emerald-700">{analysis.structured_analysis.fragments.length} found</span>
+                                      <div className="mt-1 ml-2 space-y-1">
+                                        {analysis.structured_analysis.fragments.slice(0, 3).map((fragment, idx) => (
+                                          <div key={idx} className="text-emerald-700">
+                                            • {fragment.heuristic_id}: {fragment.text_summary.substring(0, 100)}
+                                            {fragment.text_summary.length > 100 ? "..." : ""}
+                                          </div>
+                                        ))}
+                                        {analysis.structured_analysis.fragments.length > 3 && (
+                                          <div className="text-emerald-600 italic">
+                                            + {analysis.structured_analysis.fragments.length - 3} more...
+                                          </div>
+                                        )}
+                                      </div>
+                                    </div>
+                                  )}
+                                  {analysis.structured_analysis.severity_summary && (
+                                    <div>
+                                      <span className="font-medium text-emerald-800">Severity Summary:</span>{" "}
+                                      <span className="text-emerald-700">
+                                        {analysis.structured_analysis.severity_summary.visualization} - {
+                                          analysis.structured_analysis.severity_summary.mapping_clarity
+                                        }
+                                      </span>
+                                    </div>
+                                  )}
+                                </div>
+                              </>
+                            ) : (
+                              /* Legacy format */
+                              <>
+                                <div className="text-xs font-semibold text-emerald-900 mb-2">
+                                  Analysis Results:
+                                </div>
+                                <div className="space-y-1.5 text-xs">
+                                  {analysis.page_type && (
+                                    <div>
+                                      <span className="font-medium text-emerald-800">Page Type:</span>{" "}
+                                      <span className="text-emerald-700">{analysis.page_type}</span>
+                                    </div>
+                                  )}
+                                  {analysis.extracted_violations && analysis.extracted_violations.length > 0 && (
+                                    <div>
+                                      <span className="font-medium text-emerald-800">Violations Found:</span>{" "}
+                                      <span className="text-emerald-700">{analysis.extracted_violations.length}</span>
+                                      <div className="mt-1 ml-2 space-y-1">
+                                        {analysis.extracted_violations.slice(0, 3).map((violation, idx) => (
+                                          <div key={idx} className="text-emerald-700">
+                                            • {violation.heuristic_name || `H${violation.heuristic_num || violation.heuristic_number || "?"}`}: {
+                                              violation.description?.substring(0, 80) || "No description"
+                                            }
+                                            {violation.description && violation.description.length > 80 ? "..." : ""}
+                                          </div>
+                                        ))}
+                                        {analysis.extracted_violations.length > 3 && (
+                                          <div className="text-emerald-600 italic">
+                                            + {analysis.extracted_violations.length - 3} more...
+                                          </div>
+                                        )}
+                                      </div>
+                                    </div>
+                                  )}
+                                  {analysis.feedback && (
+                                    <div>
+                                      <span className="font-medium text-emerald-800">Feedback:</span>{" "}
+                                      <span className="text-emerald-700">
+                                        {analysis.feedback.substring(0, 200)}
+                                        {analysis.feedback.length > 200 ? "..." : ""}
+                                      </span>
+                                    </div>
+                                  )}
+                                </div>
+                              </>
+                            )}
+                          </div>
+                        )}
+                        {analysis && analysis.skip_analysis && (
+                          <div className="mt-2 rounded-lg border border-slate-200 bg-slate-50 p-2">
+                            <div className="text-xs text-slate-600">
+                              Skipped: {analysis.skip_reason || "No reason provided"}
                             </div>
                           </div>
                         )}
                       </div>
                     );
-                  })()
-                )}
-              </div>
-            )}
-
-            {/* Two-column layout: Report and Slide Analysis */}
-            {result && result.pages.length > 0 && (
-              <div className="grid grid-cols-2 gap-6">
-                {/* Left Column: Slide Analysis - Always show in left half */}
-                <div className="rounded-lg border-2 border-slate-300 bg-slate-50 p-6 space-y-4">
-                  <div className="flex items-center justify-between">
-                    <h2 className="text-xl font-bold text-slate-900">
-                      Slide Analysis
-                    </h2>
-                    {analyzing && analyzingProgress && (
-                      <span className="text-xs text-slate-600">
-                        {analyzingProgress.current} / {analyzingProgress.total} analyzed
-                      </span>
-                    )}
-                  </div>
-                    <div className="space-y-4 max-h-[800px] overflow-y-auto">
-                      {result.pages.map((page) => {
-                        const analysis = analysisResults?.find(a => a.page_number === page.pageNumber);
-                        const isAnalyzing = analyzing && !analysis;
-                        return (
-                          <div
-                            key={page.pageNumber}
-                            className="rounded-xl border border-slate-200 bg-white p-4"
-                          >
-                            <div className="mb-2 flex items-center justify-between">
-                              <span className="text-sm font-semibold text-slate-800">
-                                Page {page.pageNumber}
-                              </span>
-                              {isAnalyzing ? (
-                                <span className="text-xs px-2 py-1 rounded-full bg-blue-100 text-blue-800">
-                                  Analyzing...
-                                </span>
-                              ) : analysis && (
-                                <span className={`text-xs px-2 py-1 rounded-full ${
-                                  analysis.skip_analysis 
-                                    ? "bg-slate-100 text-slate-600" 
-                                    : "bg-emerald-100 text-emerald-800"
-                                }`}>
-                                  {analysis.skip_analysis ? "Skipped" : "Analyzed"}
-                                </span>
-                              )}
-                            </div>
-                            {page.imageBase64 && (
-                              <img
-                                src={page.imageBase64}
-                                alt={`Page ${page.pageNumber}`}
-                                className="mb-3 w-full rounded-lg border border-slate-200 bg-white"
-                              />
-                            )}
-
-                            {analysis && (
-                              <div className={`mt-4 rounded-lg border p-4 space-y-3 ${
-                                analysis.skip_analysis 
-                                  ? "border-slate-200 bg-slate-50" 
-                                  : "border-emerald-200 bg-emerald-50"
-                              }`}>
-                                <div className="flex items-start justify-between">
-                                  <div>
-                                    <h3 className={`text-sm font-semibold mb-1 ${
-                                      analysis.skip_analysis 
-                                        ? "text-slate-900" 
-                                        : "text-emerald-900"
-                                    }`}>
-                                      Gemini Analysis
-                                    </h3>
-                                    {analysis.page_type && (
-                                      <p className={`text-xs mb-2 ${
-                                        analysis.skip_analysis 
-                                          ? "text-slate-600" 
-                                          : "text-emerald-700"
-                                      }`}>
-                                        Page Type: {analysis.page_type}
-                                      </p>
-                                    )}
-                                    {analysis.skip_analysis && analysis.skip_reason && (
-                                      <p className="text-xs text-slate-600 italic">
-                                        {analysis.skip_reason}
-                                      </p>
-                                    )}
-                                  </div>
-                                  {!analysis.skip_analysis && analysis.compelling !== undefined && (
-                                    <span className={`text-xs px-2 py-1 rounded-full ${
-                                      analysis.compelling 
-                                        ? "bg-green-100 text-green-800" 
-                                        : "bg-amber-100 text-amber-800"
-                                    }`}>
-                                      {analysis.compelling ? "Compelling" : "Needs Improvement"}
-                                    </span>
-                                  )}
-                                </div>
-
-                                {!analysis.skip_analysis && analysis.feedback && (
-                                  <div className={`text-sm ${
-                                    analysis.skip_analysis 
-                                      ? "text-slate-800" 
-                                      : "text-emerald-800"
-                                  }`}>
-                                    <p className="font-medium mb-1">Feedback:</p>
-                                    <p className="whitespace-pre-wrap text-xs">{analysis.feedback}</p>
-                                  </div>
-                                )}
-
-                                {analysis.error && (
-                                  <div className="mt-2 text-xs text-red-600">
-                                    Error: {analysis.error}
-                                  </div>
-                                )}
-                              </div>
-                            )}
-                          </div>
-                        );
-                      })}
-                    </div>
-                  </div>
-
-                {/* Right Column: Assignment Summary & Final Score - Only show when analysis is complete */}
-                <div className="rounded-lg border-2 border-emerald-300 bg-emerald-50 p-6 space-y-4">
-                  {!analyzing && assignmentSummary ? (
-                    <>
-                    <div className="flex items-center justify-between">
-                      <h2 className="text-xl font-bold text-emerald-900">
-                        Assignment Summary & Final Score
-                      </h2>
-                      <div className="text-right">
-                        <div className="text-3xl font-bold text-emerald-700">
-                          {assignmentSummary.totalScore} / {assignmentSummary.maxScore}
-                        </div>
-                        {assignmentSummary.bonusScore > 0 && (
-                          <div className="text-sm font-medium text-emerald-600">
-                            ({assignmentSummary.baseScore} base + {assignmentSummary.bonusScore} bonus)
-                          </div>
-                        )}
-                        <div className="text-sm text-emerald-600">
-                          {assignmentSummary.percentage}%
-                        </div>
-                      </div>
-                    </div>
-
-                    <div className="grid grid-cols-2 gap-4">
-                      <div className="space-y-2">
-                        <h3 className="text-sm font-semibold text-emerald-900">Core Criteria:</h3>
-                        <div className="space-y-2 text-xs">
-                          <div>
-                            <div className="flex justify-between mb-1">
-                              <span>Coverage:</span>
-                              <span className="font-medium">{assignmentSummary.scores.coverage.points} / {assignmentSummary.scores.coverage.max}</span>
-                            </div>
-                            {assignmentSummary.scores.coverage.comment && assignmentSummary.scores.coverage.points < assignmentSummary.scores.coverage.max && (
-                              <p className="text-emerald-700 text-xs italic pl-2 border-l-2 border-emerald-300">{assignmentSummary.scores.coverage.comment}</p>
-                            )}
-                          </div>
-                          <div>
-                            <div className="flex justify-between mb-1">
-                              <span>Violation Quality:</span>
-                              <span className="font-medium">{assignmentSummary.scores.violation_quality.points} / {assignmentSummary.scores.violation_quality.max}</span>
-                            </div>
-                            {assignmentSummary.scores.violation_quality.comment && assignmentSummary.scores.violation_quality.points < assignmentSummary.scores.violation_quality.max && (
-                              <p className="text-emerald-700 text-xs italic pl-2 border-l-2 border-emerald-300">{assignmentSummary.scores.violation_quality.comment}</p>
-                            )}
-                          </div>
-                          <div>
-                            <div className="flex justify-between mb-1">
-                              <span>Screenshots:</span>
-                              <span className="font-medium">{assignmentSummary.scores.screenshots.points} / {assignmentSummary.scores.screenshots.max}</span>
-                            </div>
-                            {assignmentSummary.scores.screenshots.comment && assignmentSummary.scores.screenshots.points < assignmentSummary.scores.screenshots.max && (
-                              <p className="text-emerald-700 text-xs italic pl-2 border-l-2 border-emerald-300">{assignmentSummary.scores.screenshots.comment}</p>
-                            )}
-                          </div>
-                          <div>
-                            <div className="flex justify-between mb-1">
-                              <span>Severity Analysis:</span>
-                              <span className="font-medium">{assignmentSummary.scores.severity_analysis.points} / {assignmentSummary.scores.severity_analysis.max}</span>
-                            </div>
-                            {assignmentSummary.scores.severity_analysis.comment && assignmentSummary.scores.severity_analysis.points < assignmentSummary.scores.severity_analysis.max && (
-                              <p className="text-emerald-700 text-xs italic pl-2 border-l-2 border-emerald-300">{assignmentSummary.scores.severity_analysis.comment}</p>
-                            )}
-                          </div>
-                          <div>
-                            <div className="flex justify-between mb-1">
-                              <span>Structure & Navigation:</span>
-                              <span className="font-medium">{assignmentSummary.scores.structure_navigation.points} / {assignmentSummary.scores.structure_navigation.max}</span>
-                            </div>
-                            {assignmentSummary.scores.structure_navigation.comment && assignmentSummary.scores.structure_navigation.points < assignmentSummary.scores.structure_navigation.max && (
-                              <p className="text-emerald-700 text-xs italic pl-2 border-l-2 border-emerald-300">{assignmentSummary.scores.structure_navigation.comment}</p>
-                            )}
-                          </div>
-                          <div>
-                            <div className="flex justify-between mb-1">
-                              <span>Professional Quality:</span>
-                              <span className="font-medium">{assignmentSummary.scores.professional_quality.points} / {assignmentSummary.scores.professional_quality.max}</span>
-                            </div>
-                            {assignmentSummary.scores.professional_quality.comment && assignmentSummary.scores.professional_quality.points < assignmentSummary.scores.professional_quality.max && (
-                              <p className="text-emerald-700 text-xs italic pl-2 border-l-2 border-emerald-300">{assignmentSummary.scores.professional_quality.comment}</p>
-                            )}
-                          </div>
-                          <div>
-                            <div className="flex justify-between mb-1">
-                              <span>Writing Quality:</span>
-                              <span className="font-medium">{assignmentSummary.scores.writing_quality.points} / {assignmentSummary.scores.writing_quality.max}</span>
-                            </div>
-                            {assignmentSummary.scores.writing_quality.comment && assignmentSummary.scores.writing_quality.points < assignmentSummary.scores.writing_quality.max && (
-                              <p className="text-emerald-700 text-xs italic pl-2 border-l-2 border-emerald-300">{assignmentSummary.scores.writing_quality.comment}</p>
-                            )}
-                          </div>
-                          <div>
-                            <div className="flex justify-between mb-1">
-                              <span>Group Integration:</span>
-                              <span className="font-medium">{assignmentSummary.scores.group_integration.points} / {assignmentSummary.scores.group_integration.max}</span>
-                            </div>
-                            {assignmentSummary.scores.group_integration.comment && assignmentSummary.scores.group_integration.points < assignmentSummary.scores.group_integration.max && (
-                              <p className="text-emerald-700 text-xs italic pl-2 border-l-2 border-emerald-300">{assignmentSummary.scores.group_integration.comment}</p>
-                            )}
-                          </div>
-                        </div>
-                      </div>
-                      <div className="space-y-2">
-                        <h3 className="text-sm font-semibold text-emerald-900">Bonus:</h3>
-                        <div className="space-y-2 text-xs">
-                          <div>
-                            <div className="flex justify-between mb-1">
-                              <span>AI Opportunities:</span>
-                              <span className="font-medium">{assignmentSummary.scores.bonus_ai_opportunities.points} / {assignmentSummary.scores.bonus_ai_opportunities.max}</span>
-                            </div>
-                            {assignmentSummary.scores.bonus_ai_opportunities.comment && assignmentSummary.scores.bonus_ai_opportunities.points === 0 && (
-                              <p className="text-emerald-700 text-xs italic pl-2 border-l-2 border-emerald-300">{assignmentSummary.scores.bonus_ai_opportunities.comment}</p>
-                            )}
-                          </div>
-                          <div>
-                            <div className="flex justify-between mb-1">
-                              <span>Exceptional Quality:</span>
-                              <span className="font-medium">{assignmentSummary.scores.bonus_exceptional_quality.points} / {assignmentSummary.scores.bonus_exceptional_quality.max}</span>
-                            </div>
-                            {assignmentSummary.scores.bonus_exceptional_quality.comment && assignmentSummary.scores.bonus_exceptional_quality.points === 0 && (
-                              <p className="text-emerald-700 text-xs italic pl-2 border-l-2 border-emerald-300">{assignmentSummary.scores.bonus_exceptional_quality.comment}</p>
-                            )}
-                          </div>
-                        </div>
-                        <div className="mt-4 pt-3 border-t border-emerald-200">
-                          <div className="text-xs text-emerald-700">
-                            <div className="flex justify-between mb-1">
-                              <span>Pages Analyzed:</span>
-                              <span className="font-medium">{assignmentSummary.analyzedPages}</span>
-                            </div>
-                            {assignmentSummary.skippedPages > 0 && (
-                              <div className="flex justify-between mb-1">
-                                <span>Pages Skipped:</span>
-                                <span className="font-medium">{assignmentSummary.skippedPages}</span>
-                              </div>
-                            )}
-                            <div className="flex justify-between mb-1">
-                              <span>Total Heuristics Covered:</span>
-                              <span className="font-medium">{assignmentSummary.uniqueHeuristicsCount} / 10</span>
-                            </div>
-                            <div className="flex justify-between">
-                              <span>Total Violations Identified:</span>
-                              <span className="font-medium">{assignmentSummary.totalViolationsCount} / 12 (min)</span>
-                            </div>
-                          </div>
-                        </div>
-                      </div>
-                    </div>
-                    </>
-                  ) : (
-                    <div className="text-center text-slate-500 py-8">
-                      <p className="text-sm">
-                        {analyzing ? "Analysis in progress..." : "Analysis results will appear here"}
-                      </p>
-                    </div>
-                  )}
+                  })}
                 </div>
               </div>
             )}
 
-            {/* Student Analysis Summary - List all heuristics and severity levels - MOVED TO BOTTOM */}
-            {analysisResults && analysisResults.length > 0 && (
-              <div className="rounded-lg border-2 border-purple-300 bg-purple-50 p-6 space-y-4">
-                <h2 className="text-xl font-bold text-purple-900">
-                  Student Analysis Summary
-                </h2>
-                <div className="space-y-3">
-                  {analysisResults
-                    .filter(a => !a.skip_analysis && (a.extracted_violations || a.feedback))
-                    .map((analysis) => {
-                      // Use extracted_violations if available, otherwise fallback to parsing feedback
-                      const violations = analysis.extracted_violations || [];
-                      
-                      // Group violations by heuristic
-                      const violationsByHeuristic = new Map<number, Array<{name: string, description: string, severity: string}>>();
-                      violations.forEach((v: any) => {
-                        const hNum = v.heuristic_num || v.heuristic_number;
-                        if (hNum) {
-                          if (!violationsByHeuristic.has(hNum)) {
-                            violationsByHeuristic.set(hNum, []);
-                          }
-                          violationsByHeuristic.get(hNum)!.push({
-                            name: v.heuristic_name || "",
-                            description: v.description || "",
-                            severity: v.severity || ""
-                          });
-                        }
-                      });
-                      
-                      // Fallback: extract from feedback if no extracted_violations
-                      if (violations.length === 0 && analysis.feedback) {
-                        const heuristicMatches = Array.from((analysis.feedback || "").matchAll(/heuristic\s+(\d+)/gi));
-                        const heuristics = new Set(heuristicMatches.map(m => parseInt(m[1], 10)));
-                        heuristics.forEach(hNum => {
-                          if (!violationsByHeuristic.has(hNum)) {
-                            violationsByHeuristic.set(hNum, []);
-                          }
-                        });
-                      }
-                      
-                      return (
-                        <div key={analysis.page_number} className="rounded-lg border border-purple-200 bg-white p-3">
-                          <div className="flex items-center justify-between mb-2">
-                            <h3 className="text-sm font-semibold text-purple-900">
-                              Page {analysis.page_number}
-                            </h3>
-                            {analysis.page_type && (
-                              <span className="text-xs text-purple-600">
-                                {analysis.page_type}
-                              </span>
-                            )}
-                          </div>
-                          <div className="text-xs text-purple-800 space-y-2">
-                            <div>
-                              <span className="font-medium">Heuristics & Violations:</span>
-                              <div className="mt-1 space-y-2">
-                                {Array.from(violationsByHeuristic.entries())
-                                  .sort((a, b) => a[0] - b[0])
-                                  .map(([hNum, violationsList]) => {
-                                    const heuristic = heuristicsInfo.find((h: HeuristicInfo) => h.number === hNum);
-                                    const heuristicName = violationsList[0]?.name || heuristic?.name || `Heuristic ${hNum}`;
-                                    
-                                    return (
-                                      <div key={hNum} className="pl-2 border-l-2 border-purple-300">
-                                        <div className="font-medium text-purple-900">
-                                          H{hNum}: {heuristicName}
-                                        </div>
-                                        {heuristic?.description && (
-                                          <div className="text-purple-600 italic text-xs mt-0.5 mb-1">
-                                            {heuristic.description}
-                                          </div>
-                                        )}
-                                        <div className="mt-1 space-y-1 ml-2">
-                                          {violationsList.map((v, idx) => (
-                                            <div key={idx} className="text-purple-700">
-                                              <span className="font-medium">Violation {idx + 1}:</span>{" "}
-                                              <span>{v.description || "No description"}</span>
-                                              {v.severity && (
-                                                <span className="ml-2 px-1.5 py-0.5 rounded bg-purple-100 text-purple-800 font-medium">
-                                                  Severity: {v.severity}
-                                                </span>
-                                              )}
-                                            </div>
-                                          ))}
-                                        </div>
-                                      </div>
-                                    );
-                                  })}
-                              </div>
-                            </div>
-                            {analysis.feedback && (
-                              <div className="mt-2 pt-2 border-t border-purple-200 text-purple-700 italic">
-                                {analysis.feedback.substring(0, 300)}
-                                {analysis.feedback.length > 300 ? "..." : ""}
-                              </div>
-                            )}
-                          </div>
-                        </div>
-                      );
-                    })}
-                </div>
-              </div>
-            )}
 
             {result && result.pages.length === 0 ? (
               <p className="text-sm text-slate-500">

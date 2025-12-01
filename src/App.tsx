@@ -2,8 +2,9 @@
 import { Link, Route, Routes } from "react-router-dom";
 import { HomePage } from "./pages/HomePage";
 import UploadPage from "./pages/UploadPage";
-import ReviewerModePage from "./pages/ReviewerModePage";
 import PromptRefinementPage from "./pages/PromptRefinementPage";
+import FinalDetailPage from "./pages/FinalDetailPage";
+import IssueReviewerPage from "./pages/IssueReviewerPage";
 
 export default function App() {
   return (
@@ -18,10 +19,10 @@ export default function App() {
               Grade PDF
             </Link>
             <Link
-              to="/reviewer"
+              to="/issue-reviewer"
               className="text-slate-600 hover:text-slate-900"
             >
-              Reviewer Mode
+              Issue Reviewer
             </Link>
             <Link
               to="/prompt-refinement"
@@ -52,18 +53,26 @@ export default function App() {
             }
           />
           <Route
-            path="/reviewer"
-            element={
-              <div className="mx-auto px-4 py-6">
-                <ReviewerModePage />
-              </div>
-            }
-          />
-          <Route
             path="/prompt-refinement"
             element={
               <div className="mx-auto px-4 py-6">
                 <PromptRefinementPage />
+              </div>
+            }
+          />
+          <Route
+            path="/final-detail"
+            element={
+              <div className="mx-auto px-4 py-6">
+                <FinalDetailPage />
+              </div>
+            }
+          />
+          <Route
+            path="/issue-reviewer"
+            element={
+              <div className="mx-auto px-4 py-6">
+                <IssueReviewerPage />
               </div>
             }
           />
