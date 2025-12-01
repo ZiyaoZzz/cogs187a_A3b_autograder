@@ -3630,10 +3630,10 @@ OUTPUT FORMAT (JSON):
     {{
       "heuristic_id": "<H1-H10 or Hx_unknown>",
       "issue_key": "<2-6 words, snake_case, e.g., 'navbar_low_contrast'>",
-      "fragment_role": ["<problem_description|impact|evidence|design_rationale|fix_idea>", ...],
+      "fragment_role": ["<problem_description|impact|evidence|design_rationale|fix_idea>", "<add up to 2 more roles>"],
       "text_summary": "<1-2 sentences, paraphrase what page says about this issue>",
       "severity_hint": "<optional: minor|major|critical>",
-      "rubric_tags": ["<optional: coverage|violation_quality|severity_analysis|screenshots_evidence>", ...]
+      "rubric_tags": ["<optional: coverage|violation_quality|severity_analysis|screenshots_evidence>", "<add more tags if relevant>"]
     }}
   ],
   "severity_summary": {{
