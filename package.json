@@ -4,10 +4,12 @@
     "private": true,
     "scripts": {
         "dev": "vite",
+        "frontend": "vite",
         "build": "vite build",
         "preview": "vite preview",
         "start": "./start.sh",
-        "backend": "cd backend && (if [ -f ../.venv/bin/python ]; then ../.venv/bin/python -m uvicorn main:app --reload --host 0.0.0.0 --port 8000; elif [ -f ../.venv/Scripts/python.exe ]; then ../.venv/Scripts/python.exe -m uvicorn main:app --reload --host 0.0.0.0 --port 8000; else python3 -m uvicorn main:app --reload --host 0.0.0.0 --port 8000; fi)"
+        "backend": "cd backend && (if [ -f ../.venv/bin/python ]; then ../.venv/bin/python -m uvicorn main:app --reload --host 0.0.0.0 --port 8000; elif [ -f ../.venv/Scripts/python.exe ]; then ../.venv/Scripts/python.exe -m uvicorn main:app --reload --host 0.0.0.0 --port 8000; else python3 -m uvicorn main:app --reload --host 0.0.0.0 --port 8000; fi)",
+        "dev:full": "concurrently \"npm run backend\" \"npm run frontend\""
     },
     "dependencies": {
         "react": "^18.3.1",

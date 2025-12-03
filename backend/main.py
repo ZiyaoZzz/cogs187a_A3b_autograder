@@ -46,7 +46,6 @@ else:
 
 # Load rubric (includes heuristics list)
 RUBRIC_PATH = Path(__file__).parent.parent / "rubrics" / "a3_rubric.json"
-RUBRIC_V2_PATH = Path(__file__).parent.parent / "rubrics" / "v2" / "a3_rubric_v2.json"
 RUBRIC_DATA = None
 if RUBRIC_PATH.exists():
     with open(RUBRIC_PATH, "r", encoding="utf-8") as f:
@@ -539,6 +538,40 @@ ANALYSIS_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 PAGES_ISSUES_DIR = Path(__file__).parent.parent / "output_static" / "pages_issues"
 PAGES_ISSUES_DIR.mkdir(parents=True, exist_ok=True)
 
+
+# ============================================================================
+# JSON File Operation Helpers (to reduce code duplication)
+# ============================================================================
+
+def load_json_file(file_path: Path, default: Any = None) -> Any:
+    """Load JSON file with error handling. Returns default if file doesn't exist or fails to load."""
+    if not file_path.exists():
+        return default
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"Error loading JSON file {file_path}: {e}")
+        return default
+
+
+def save_json_file(file_path: Path, data: Any, create_dirs: bool = True) -> bool:
+    """Save data to JSON file with error handling. Returns True if successful."""
+    try:
+        if create_dirs:
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(file_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        return True
+    except Exception as e:
+        print(f"Error saving JSON file {file_path}: {e}")
+        return False
+
+
+def get_job_file_path(job_id: str, filename: str, base_dir: Path = PAGES_ISSUES_DIR) -> Path:
+    """Get file path for a job-specific file."""
+    return base_dir / f"{job_id}_{filename}"
+
 @app.post("/api/analyze-single-page")
 async def analyze_single_page(request: Dict[str, Any]) -> Dict[str, Any]:
     """Analyze a single PDF page using Gemini."""
@@ -564,10 +597,13 @@ async def analyze_single_page(request: Dict[str, Any]) -> Dict[str, Any]:
     has_image = bool(image_base64)
     job_id = request.get("jobId", f"job-{int(time.time() * 1000)}")
     
+    # Get previous pages context for heuristic hint
+    previous_pages_context = request.get("previousPages", [])
+    
     try:
         # Use new structured page analysis prompt
         truncated_content = snippet[:2500] + ("..." if len(snippet) > 2500 else "")
-        prompt = get_page_analysis_prompt(page_number, truncated_content, has_image)
+        prompt = get_page_analysis_prompt(page_number, truncated_content, has_image, previous_pages_context)
         
         # Prepare content for Gemini
         content_parts = [prompt]
@@ -866,9 +902,8 @@ async def get_extraction_result(jobId: str) -> Dict[str, Any]:
     # Try to load from stored results
     extraction_file = ANALYSIS_OUTPUT_DIR.parent / f"{jobId}_extraction.json"
     
-    if extraction_file.exists():
-        with open(extraction_file, "r", encoding="utf-8") as f:
-            data = json.load(f)
+    data = load_json_file(extraction_file)
+    if data:
             # Normalize field names: convert image_base64 to imageBase64 and page_number to pageNumber
             pages = data.get("pages", [])
             normalized_pages = []
@@ -924,23 +959,16 @@ async def get_analysis_results(jobId: str) -> Dict[str, Any]:
                 pages_data.append(structured)
         
         if pages_data:
-            pages_file = PAGES_ISSUES_DIR / f"{jobId}_pages.json"
-            with open(pages_file, "w", encoding="utf-8") as f:
-                json.dump(pages_data, f, indent=2, ensure_ascii=False)
+            pages_file = get_job_file_path(jobId, "pages.json")
+            save_json_file(pages_file, pages_data)
             
             # Aggregate issues and save
             issues = aggregate_issues(pages_data)
             issues_file = PAGES_ISSUES_DIR / f"{jobId}_issues.json"
             
             # Load existing issues to preserve TA reviews
-            existing_issues = []
-            if issues_file.exists():
-                try:
-                    with open(issues_file, "r", encoding="utf-8") as f:
-                        existing_issues_data = json.load(f)
-                        existing_issues = existing_issues_data.get("issues", [])
-                except Exception:
-                    pass
+            existing_issues_data = load_json_file(issues_file, {})
+            existing_issues = existing_issues_data.get("issues", []) if isinstance(existing_issues_data, dict) else []
             
             # Merge TA reviews from existing issues
             existing_issues_dict = {issue.get("issue_id"): issue for issue in existing_issues}
@@ -949,8 +977,7 @@ async def get_analysis_results(jobId: str) -> Dict[str, Any]:
                 if existing_issue and existing_issue.get("ta_review"):
                     issue["ta_review"] = existing_issue["ta_review"]
             
-            with open(issues_file, "w", encoding="utf-8") as f:
-                json.dump({"issues": issues}, f, indent=2, ensure_ascii=False)
+            save_json_file(issues_file, {"issues": issues})
     except Exception as e:
         print(f"Warning: Failed to save pages/issues JSON: {e}")
     
@@ -961,13 +988,9 @@ async def get_analysis_results(jobId: str) -> Dict[str, Any]:
 async def get_overrides(jobId: str) -> Dict[str, Any]:
     """Get all override records for a job ID."""
     overrides_file = OVERRIDES_DIR / f"{jobId}_overrides.json"
-    
-    if overrides_file.exists():
-        with open(overrides_file, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            return {"jobId": jobId, "overrides": data.get("overrides", [])}
-    
-    return {"jobId": jobId, "overrides": []}
+    data = load_json_file(overrides_file, {})
+    overrides = data.get("overrides", []) if isinstance(data, dict) else []
+    return {"jobId": jobId, "overrides": overrides}
 
 
 @app.get("/api/get-issues")
@@ -985,19 +1008,14 @@ async def get_issues(jobId: str = Query(..., description="Job ID to get issues f
             print(f"Error loading issues: {e}")
     
     # If no issues file exists, try to generate from pages
-    pages_file = PAGES_ISSUES_DIR / f"{jobId}_pages.json"
-    if pages_file.exists():
-        try:
-            with open(pages_file, "r", encoding="utf-8") as f:
-                pages_data = json.load(f)
-                issues = aggregate_issues(pages_data)
-                # Save the generated issues
-                issues_file = PAGES_ISSUES_DIR / f"{jobId}_issues.json"
-                with open(issues_file, "w", encoding="utf-8") as f:
-                    json.dump({"issues": issues}, f, indent=2, ensure_ascii=False)
-                return {"jobId": jobId, "issues": issues}
-        except Exception as e:
-            print(f"Error generating issues from pages: {e}")
+    pages_file = get_job_file_path(jobId, "pages.json")
+    pages_data = load_json_file(pages_file)
+    if pages_data:
+        issues = aggregate_issues(pages_data)
+        # Save the generated issues
+        issues_file = get_job_file_path(jobId, "issues.json")
+        if save_json_file(issues_file, {"issues": issues}):
+            return {"jobId": jobId, "issues": issues}
     
     return {"jobId": jobId, "issues": []}
 
@@ -1012,41 +1030,35 @@ async def update_issue_review(request: Dict[str, Any]) -> Dict[str, Any]:
     if not job_id or not issue_id:
         raise HTTPException(status_code=400, detail="jobId and issueId are required")
     
-    issues_file = PAGES_ISSUES_DIR / f"{job_id}_issues.json"
+    issues_file = get_job_file_path(job_id, "issues.json")
+    data = load_json_file(issues_file)
     
-    if not issues_file.exists():
+    if not data:
         raise HTTPException(status_code=404, detail="Issues file not found. Please run analysis first.")
     
-    try:
-        with open(issues_file, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            issues = data.get("issues", [])
-        
-        # Find and update the issue
-        issue_found = False
-        for issue in issues:
-            if issue.get("issue_id") == issue_id:
-                issue["ta_review"] = ta_review
-                issue_found = True
-                break
-        
-        if not issue_found:
-            raise HTTPException(status_code=404, detail=f"Issue {issue_id} not found")
-        
-        # Save back
-        with open(issues_file, "w", encoding="utf-8") as f:
-            json.dump({"issues": issues}, f, indent=2, ensure_ascii=False)
-        
-        return {
-            "status": "success",
-            "jobId": job_id,
-            "issueId": issue_id,
-            "ta_review": ta_review,
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error updating issue review: {str(e)}")
+    issues = data.get("issues", []) if isinstance(data, dict) else []
+    
+    # Find and update the issue
+    issue_found = False
+    for issue in issues:
+        if issue.get("issue_id") == issue_id:
+            issue["ta_review"] = ta_review
+            issue_found = True
+            break
+    
+    if not issue_found:
+        raise HTTPException(status_code=404, detail=f"Issue {issue_id} not found")
+    
+    # Save back
+    if not save_json_file(issues_file, {"issues": issues}):
+        raise HTTPException(status_code=500, detail="Failed to save updated issues")
+    
+    return {
+        "status": "success",
+        "jobId": job_id,
+        "issueId": issue_id,
+        "ta_review": ta_review,
+    }
 
 
 def calculate_grading_scores(pages: List[Dict[str, Any]], issues: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -1159,27 +1171,14 @@ def calculate_grading_scores(pages: List[Dict[str, Any]], issues: List[Dict[str,
 @app.get("/api/calculate-grading-scores")
 async def calculate_grading_scores_endpoint(jobId: str) -> Dict[str, Any]:
     """Calculate grading scores based on pages and issues metadata."""
-    pages_file = PAGES_ISSUES_DIR / f"{jobId}_pages.json"
-    issues_file = PAGES_ISSUES_DIR / f"{jobId}_issues.json"
+    pages_file = get_job_file_path(jobId, "pages.json")
+    issues_file = get_job_file_path(jobId, "issues.json")
     
-    pages = []
-    issues = []
+    pages_data = load_json_file(pages_file, {})
+    issues_data = load_json_file(issues_file, {})
     
-    if pages_file.exists():
-        try:
-            with open(pages_file, "r", encoding="utf-8") as f:
-                pages_data = json.load(f)
-                pages = pages_data.get("pages", [])
-        except Exception as e:
-            print(f"Error loading pages: {e}")
-    
-    if issues_file.exists():
-        try:
-            with open(issues_file, "r", encoding="utf-8") as f:
-                issues_data = json.load(f)
-                issues = issues_data.get("issues", [])
-        except Exception as e:
-            print(f"Error loading issues: {e}")
+    pages = pages_data.get("pages", []) if isinstance(pages_data, dict) else (pages_data if isinstance(pages_data, list) else [])
+    issues = issues_data.get("issues", []) if isinstance(issues_data, dict) else (issues_data if isinstance(issues_data, list) else [])
     
     scores = calculate_grading_scores(pages, issues)
     
@@ -1223,41 +1222,25 @@ Bonus criteria (optional, evaluated based on overall quality):
 
 def load_pages_for_job(job_id: str) -> List[Dict[str, Any]]:
     """Load pages.json for a given job."""
-    pages_file = PAGES_ISSUES_DIR / f"{job_id}_pages.json"
-    if pages_file.exists():
-        try:
-            with open(pages_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                # Handle both formats: {"pages": [...]} and [...]
-                if isinstance(data, list):
-                    return data
-                elif isinstance(data, dict):
-                    return data.get("pages", [])
-                else:
-                    return []
-        except Exception as e:
-            print(f"Error loading pages for job {job_id}: {e}")
-            return []
+    pages_file = get_job_file_path(job_id, "pages.json")
+    data = load_json_file(pages_file, {})
+    # Handle both formats: {"pages": [...]} and [...]
+    if isinstance(data, list):
+        return data
+    elif isinstance(data, dict):
+        return data.get("pages", [])
     return []
 
 
 def load_issues_for_job(job_id: str) -> List[Dict[str, Any]]:
     """Load issues.json for a given job."""
-    issues_file = PAGES_ISSUES_DIR / f"{job_id}_issues.json"
-    if issues_file.exists():
-        try:
-            with open(issues_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                # Handle both formats: {"issues": [...]} and [...]
-                if isinstance(data, list):
-                    return data
-                elif isinstance(data, dict):
-                    return data.get("issues", [])
-                else:
-                    return []
-        except Exception as e:
-            print(f"Error loading issues for job {job_id}: {e}")
-            return []
+    issues_file = get_job_file_path(job_id, "issues.json")
+    data = load_json_file(issues_file, {})
+    # Handle both formats: {"issues": [...]} and [...]
+    if isinstance(data, list):
+        return data
+    elif isinstance(data, dict):
+        return data.get("issues", [])
     return []
 
 
@@ -1352,20 +1335,50 @@ def build_scoring_input(job_id: str, pages: List[Dict[str, Any]], issues: List[D
     return result
 
 
-async def call_grading_llm(scoring_input: Dict[str, Any]) -> str:
+async def call_grading_llm(scoring_input: Dict[str, Any], job_id: str = None) -> str:
     """Call LLM with grading prompt and return JSON response."""
     if not MODEL:
         raise HTTPException(status_code=500, detail="Gemini model not initialized. Please set GEMINI_API_KEY.")
+    
+    # Load rubric component comments if job_id is provided
+    rubric_comments_text = ""
+    if job_id:
+        rubric_comments_file = PAGES_ISSUES_DIR / f"{job_id}_rubric_comments.json"
+        if rubric_comments_file.exists():
+            try:
+                with open(rubric_comments_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    rubric_comments = data.get("comments", {})
+                    if rubric_comments:
+                        rubric_comments_text = "\n\n**TA RUBRIC COMPONENT COMMENTS:**\n"
+                        for component, comment in rubric_comments.items():
+                            if comment and comment.strip():
+                                # Only include comments that are detailed enough (60+ chars)
+                                if len(comment.strip()) >= 60:
+                                    rubric_comments_text += f"- **{component}**: {comment.strip()}\n"
+                                elif len(comment.strip()) >= 25:
+                                    rubric_comments_text += f"- **{component}**: {comment.strip()} (Note: Consider elaborating for better clarity)\n"
+            except Exception as e:
+                print(f"[WARN] Could not load rubric comments: {e}")
     
     # Load the modularized grading prompt from file
     grading_prompt_content = get_current_prompt()
     
     # Replace the placeholder for ScoringInput JSON
     if "{json.dumps(scoring_input, indent=2)}" in grading_prompt_content:
-        prompt = grading_prompt_content.replace(
-            "{json.dumps(scoring_input, indent=2)}",
-            json.dumps(scoring_input, indent=2)
-        )
+        # Inject rubric comments before ScoringInput if present
+        if rubric_comments_text:
+            # Find the position where ScoringInput JSON should be inserted
+            placeholder = "{json.dumps(scoring_input, indent=2)}"
+            prompt = grading_prompt_content.replace(
+                placeholder,
+                rubric_comments_text + "\n\n" + json.dumps(scoring_input, indent=2)
+            )
+        else:
+            prompt = grading_prompt_content.replace(
+                "{json.dumps(scoring_input, indent=2)}",
+                json.dumps(scoring_input, indent=2)
+            )
     else:
         # Fallback to old prompt structure if file doesn't have the new format
         # Use the old prompt structure as fallback
@@ -1582,6 +1595,8 @@ The ScoringInput JSON contains:
 2. **Submission metadata**: Overall statistics (num_pages, num_issues, num_heuristics, page_roles distribution)
 3. **AI opportunities pages** (optional): Pages where students discuss how AI could help address UX issues
 
+{rubric_comments_text if rubric_comments_text else ""}
+
 Now here is the ScoringInput JSON:
 
 ```json
@@ -1590,11 +1605,19 @@ Now here is the ScoringInput JSON:
 """
     
     try:
+        # Use minimal temperature for maximum consistency
+        # Note: Gemini may round very low temperatures to 0, which is fine for deterministic scoring
         generation_config = {
-            "temperature": 0.2,
+            "temperature": 0.0,  # Set to 0 for maximum determinism and consistency - same input should produce same output
             "max_output_tokens": 16384,  # Increased significantly for detailed grading responses with explanations (prompt is ~6800 tokens)
             "response_mime_type": "application/json",
         }
+        
+        # Add top_p if supported (helps reduce randomness further)
+        try:
+            generation_config["top_p"] = 0.95
+        except:
+            pass  # Ignore if not supported
         
         response = MODEL.generate_content(prompt, generation_config=generation_config)
         
@@ -1914,14 +1937,13 @@ def parse_scoring_output(raw: str) -> Dict[str, Any]:
 
 def save_job_scoring(job_id: str, scoring_output: Dict[str, Any]) -> None:
     """Save scoring output to disk."""
-    scoring_file = PAGES_ISSUES_DIR / f"{job_id}_scoring.json"
+    scoring_file = get_job_file_path(job_id, "scoring.json")
     data = {
         "job_id": job_id,
         "scoring": scoring_output,
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
     }
-    with open(scoring_file, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+    save_json_file(scoring_file, data)
 
 
 def compare_scoring_changes(old_scoring: Dict[str, Any], new_scoring: Dict[str, Any]) -> Dict[str, Any]:
@@ -2174,10 +2196,34 @@ TA RUBRIC COMMENTS (JSON):
 
 TASK:
 1. Summarize, in 2–3 sentences, what these TA comments are asking for (focus on rubric components and tone/expectations).
-2. Provide 2–4 actionable recommendations describing how the grading prompt should change.
-3. Apply those recommendations to the CURRENT PROMPT (between PROMPT_START and PROMPT_END) and return the full revised prompt with MINIMAL edits.
-4. Do NOT change the ScoringInput or ScoringOutput JSON schemas, and do NOT add/remove/rename ANY keys. Treat all JSON field names and structures in the prompt as a fixed API contract that must stay exactly the same.
-5. Keep the overall section structure, headings, and numbering identical. Prefer local wording tweaks, clarification sentences, or short insertions rather than large rewrites. Preserve the majority of the existing text and organization.
+
+2. **DECIDE whether modifications are needed:**
+   - If TA comments are empty, unclear, too vague → Set recommendations to [] (empty array) and keep modified_prompt IDENTICAL to current_prompt
+   - If the requested changes are too repetitive or already addressed in the current prompt → Set recommendations to [] and keep modified_prompt IDENTICAL to current_prompt
+   - If the requested changes would significantly alter the prompt structure or JSON schemas (which must stay fixed) → Set recommendations to [] and keep modified_prompt IDENTICAL to current_prompt
+   - Only if TA comments provide clear, actionable, non-repetitive feedback that would improve the prompt → Provide 2–4 actionable recommendations
+
+3. **ONLY if you provided recommendations (recommendations array is NOT empty):**
+   - Apply those recommendations to the CURRENT PROMPT and return the FULL REVISED PROMPT in the "modified_prompt" field
+   - Read the CURRENT PROMPT carefully (between PROMPT_START and PROMPT_END)
+   - For EACH recommendation, identify the specific section(s) in the prompt that need to be modified
+   - Make the MINIMAL changes needed to address each recommendation
+   - Return the COMPLETE modified prompt in "modified_prompt" - it MUST be different from the current prompt
+
+4. **If you did NOT provide recommendations (recommendations array IS empty):**
+   - Set "modified_prompt" to be IDENTICAL to the current prompt (copy it exactly, no changes)
+   - In your analysis_summary, explain why no modifications were needed (e.g., "TA comments were too vague", "Changes already addressed in current prompt", "Would break JSON schema requirements", "Comments are too repetitive", etc.)
+
+5. Do NOT change the ScoringInput or ScoringOutput JSON schemas, and do NOT add/remove/rename ANY keys. Treat all JSON field names and structures in the prompt as a fixed API contract that must stay exactly the same.
+
+6. Keep the overall section structure, headings, and numbering identical. Prefer local wording tweaks, clarification sentences, or short insertions rather than large rewrites. Preserve the majority of the existing text and organization.
+
+**CRITICAL RULES:**
+- If recommendations array is empty → modified_prompt MUST be IDENTICAL to current_prompt (copy it exactly)
+- If recommendations array is not empty → modified_prompt MUST be DIFFERENT from current_prompt and include the changes
+- DO NOT make changes if TA comments are unclear, too vague, too short, or would break the prompt structure
+- DO NOT make changes if the requested modifications are already present in the current prompt
+- DO NOT make changes if the comments are repetitive or don't add value
 
 OUTPUT (valid JSON only):
 {{
@@ -2229,28 +2275,102 @@ OUTPUT (valid JSON only):
                             rec = m.group(1).strip()
                             if rec:
                                 recs.append(rec)
+                    # Try to extract modified_prompt from response text
+                    modified_prompt_extracted = current_prompt
+                    prompt_start_marker = "PROMPT_START"
+                    prompt_end_marker = "PROMPT_END"
+                    start_idx = response_text.find(prompt_start_marker)
+                    end_idx = response_text.find(prompt_end_marker)
+                    if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+                        extracted = response_text[start_idx + len(prompt_start_marker):end_idx].strip()
+                        extracted = extracted.replace('\\n', '\n').replace('\\"', '"')
+                        if extracted and extracted != current_prompt.strip():
+                            modified_prompt_extracted = extracted
+                    
                     if summary_text or recs:
                         return {
-                            "analysis_summary": summary_text or "LLM returned non-strict JSON. Showing raw text instead:\n\n" + preview,
+                            "analysis_summary": (summary_text or "LLM returned non-strict JSON. Showing raw text instead:\n\n" + preview) + 
+                                ("\n\n⚠️ WARNING: Could not parse full JSON response. Please verify the modified_prompt contains actual changes." if modified_prompt_extracted == current_prompt else ""),
                             "recommendations": recs,
-                            "modified_prompt": current_prompt,
+                            "modified_prompt": modified_prompt_extracted,
                         }
                     return {
-                        "analysis_summary": "LLM returned non-strict JSON. Showing raw text instead:\n\n" + preview,
+                        "analysis_summary": "LLM returned non-strict JSON. Showing raw text instead:\n\n" + preview + 
+                            "\n\n⚠️ WARNING: Could not parse JSON response. The modified_prompt may not contain actual changes.",
                         "recommendations": [],
-                        "modified_prompt": current_prompt,
+                        "modified_prompt": modified_prompt_extracted,
                     }
             # 完全找不到 JSON 結構，只能回傳原文
             preview = response_text[:2000]
+            # Try to extract modified_prompt from response text even if JSON parsing failed
+            modified_prompt_extracted = current_prompt
+            prompt_start_marker = "PROMPT_START"
+            prompt_end_marker = "PROMPT_END"
+            start_idx = response_text.find(prompt_start_marker)
+            end_idx = response_text.find(prompt_end_marker)
+            if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+                extracted = response_text[start_idx + len(prompt_start_marker):end_idx].strip()
+                extracted = extracted.replace('\\n', '\n').replace('\\"', '"')
+                if extracted and extracted != current_prompt.strip():
+                    modified_prompt_extracted = extracted
+            
             return {
-                "analysis_summary": "LLM returned non-strict JSON. Showing raw text instead:\n\n" + preview,
+                "analysis_summary": "LLM returned non-strict JSON. Showing raw text instead:\n\n" + preview + 
+                    ("\n\n⚠️ WARNING: Could not parse JSON response. The modified_prompt may not contain actual changes." if modified_prompt_extracted == current_prompt else ""),
                 "recommendations": [],
-                "modified_prompt": current_prompt,
+                "modified_prompt": modified_prompt_extracted,
             }
 
         analysis.setdefault("analysis_summary", "No summary provided.")
         analysis.setdefault("recommendations", [])
         analysis.setdefault("modified_prompt", current_prompt)
+        
+        # CRITICAL: Verify that modified_prompt matches the recommendations
+        modified_prompt = analysis.get("modified_prompt", current_prompt)
+        recommendations = analysis.get("recommendations", [])
+        
+        # Check if modified_prompt is the same as current_prompt
+        is_unchanged = modified_prompt.strip() == current_prompt.strip()
+        
+        if is_unchanged:
+            # Try to extract modified_prompt from the response if it exists
+            # Look for text between PROMPT_START and PROMPT_END markers
+            prompt_start_marker = "PROMPT_START"
+            prompt_end_marker = "PROMPT_END"
+            start_idx = response_text.find(prompt_start_marker)
+            end_idx = response_text.find(prompt_end_marker)
+            if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+                extracted_prompt = response_text[start_idx + len(prompt_start_marker):end_idx].strip()
+                # Remove any JSON escaping
+                extracted_prompt = extracted_prompt.replace('\\n', '\n').replace('\\"', '"')
+                if extracted_prompt and extracted_prompt != current_prompt.strip():
+                    print(f"[INFO] Extracted modified_prompt from response text")
+                    analysis["modified_prompt"] = extracted_prompt
+                    modified_prompt = extracted_prompt
+                    is_unchanged = False
+        
+        # Validation logic based on recommendations
+        if recommendations and len(recommendations) > 0:
+            # If we have recommendations, the prompt MUST be different
+            if is_unchanged:
+                analysis["analysis_summary"] = (
+                    analysis.get("analysis_summary", "") + 
+                    "\n\n⚠️ WARNING: The LLM provided recommendations but did not apply them to the prompt. "
+                    "The modified_prompt is identical to the current prompt. Please review the recommendations manually and apply changes yourself."
+                )
+                print(f"[WARNING] Recommendations provided but not applied to prompt. Recommendations: {recommendations[:2]}")
+        else:
+            # If no recommendations, the prompt should be unchanged (this is expected and correct)
+            if not is_unchanged:
+                # This is unexpected - no recommendations but prompt changed
+                # Force it back to current_prompt since LLM shouldn't have made changes
+                print(f"[INFO] No recommendations provided, but modified_prompt differs from current_prompt. Setting modified_prompt to current_prompt.")
+                analysis["modified_prompt"] = current_prompt
+                modified_prompt = current_prompt
+            else:
+                # This is correct - no recommendations and no changes
+                print(f"[INFO] No recommendations provided, and modified_prompt matches current_prompt (as expected).")
+        
         return analysis
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to generate prompt analysis: {str(e)}")
@@ -2288,32 +2408,27 @@ async def recompute_job_scores(job_id: str, clear_reviews: bool = True) -> Dict[
     if clear_reviews:
         print(f"[DEBUG] Clearing TA reviews for job {job_id}")
         issues_file = PAGES_ISSUES_DIR / f"{job_id}_issues.json"
-        if issues_file.exists():
-            try:
-                with open(issues_file, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    issues_data = data.get("issues", [])
-                
-                # Clear ta_review from all issues
-                for issue in issues_data:
-                    if "ta_review" in issue:
-                        del issue["ta_review"]
-                
-                # Save back
-                with open(issues_file, "w", encoding="utf-8") as f:
-                    json.dump({"issues": issues_data}, f, indent=2, ensure_ascii=False)
-                
+        issues_file = get_job_file_path(job_id, "issues.json")
+        data = load_json_file(issues_file)
+        if data:
+            issues_data = data.get("issues", []) if isinstance(data, dict) else []
+            
+            # Clear ta_review from all issues
+            for issue in issues_data:
+                if "ta_review" in issue:
+                    del issue["ta_review"]
+            
+            # Save back
+            if save_json_file(issues_file, {"issues": issues_data}):
                 # Reload issues after clearing
                 issues = load_issues_for_job(job_id)
                 print(f"[DEBUG] Cleared TA reviews from {len(issues_data)} issues")
-            except Exception as e:
-                print(f"[WARNING] Could not clear TA reviews: {e}")
     
     # 2. Build ScoringInput
     scoring_input = build_scoring_input(job_id, pages, issues)
     
-    # 3. Call LLM
-    llm_response = await call_grading_llm(scoring_input)
+    # 3. Call LLM (pass job_id to load rubric comments)
+    llm_response = await call_grading_llm(scoring_input, job_id=job_id)
     
     # 4. Parse response
     scoring_output = parse_scoring_output(llm_response)
@@ -2435,18 +2550,85 @@ async def update_grading_prompt(request: Dict[str, Any]) -> Dict[str, Any]:
         raise HTTPException(status_code=500, detail=f"Failed to update prompt: {str(e)}")
 
 
+@app.post("/api/backup-grading-prompt")
+async def backup_grading_prompt() -> Dict[str, Any]:
+    """Backup the current grading prompt as the original prompt. Only creates backup if it doesn't exist."""
+    try:
+        if not GRADING_PROMPT_FILE.exists():
+            raise HTTPException(status_code=404, detail="Current grading prompt file does not exist")
+        
+        # Check if backup already exists
+        if GRADING_PROMPT_BACKUP_FILE.exists():
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Backup already exists at {GRADING_PROMPT_BACKUP_FILE.name}. The original prompt backup cannot be overwritten. If you need to create a new backup, please manually delete the existing backup file first."
+            )
+        
+        # Read current prompt (this is the original prompt to be backed up)
+        with open(GRADING_PROMPT_FILE, "r", encoding="utf-8") as f:
+            original_prompt = f.read()
+        
+        # Save to backup file (this is the original prompt, never modified by code)
+        GRADING_PROMPT_BACKUP_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(GRADING_PROMPT_BACKUP_FILE, "w", encoding="utf-8") as f:
+            f.write(original_prompt)
+        
+        return {
+            "ok": True,
+            "message": f"Original prompt backed up successfully to {GRADING_PROMPT_BACKUP_FILE.name}. This backup will never be modified automatically.",
+            "backup_path": str(GRADING_PROMPT_BACKUP_FILE.relative_to(Path(__file__).parent.parent))
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to backup prompt: {str(e)}")
+
+
+@app.post("/api/restore-grading-prompt")
+async def restore_grading_prompt() -> Dict[str, Any]:
+    """Restore the grading prompt from the original backup file."""
+    try:
+        if not GRADING_PROMPT_BACKUP_FILE.exists():
+            raise HTTPException(status_code=404, detail="Backup file does not exist. Please create a backup of the original prompt first.")
+        
+        # Read original prompt from backup
+        with open(GRADING_PROMPT_BACKUP_FILE, "r", encoding="utf-8") as f:
+            original_prompt = f.read()
+        
+        # Restore original prompt to main file
+        success = save_prompt_to_backend(original_prompt)
+        if success:
+            return {
+                "ok": True,
+                "message": "Prompt restored successfully from original backup"
+            }
+        else:
+            raise HTTPException(status_code=500, detail="Failed to restore prompt")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to restore prompt: {str(e)}")
+
+
+@app.get("/api/check-backup-exists")
+async def check_backup_exists() -> Dict[str, Any]:
+    """Check if a backup file exists."""
+    backup_exists = GRADING_PROMPT_BACKUP_FILE.exists()
+    return {
+        "ok": True,
+        "backup_exists": backup_exists,
+        "backup_path": str(GRADING_PROMPT_BACKUP_FILE.relative_to(Path(__file__).parent.parent)) if backup_exists else None
+    }
+
+
 @app.get("/api/jobs/{jobId}/scoring")
 async def get_scoring_output(jobId: str) -> Dict[str, Any]:
     """Get saved scoring output for a job."""
-    scoring_file = PAGES_ISSUES_DIR / f"{jobId}_scoring.json"
-    if scoring_file.exists():
-        try:
-            with open(scoring_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                return {"ok": True, "scoring": data.get("scoring", {})}
-        except Exception as e:
-            print(f"Error loading scoring output: {e}")
-            raise HTTPException(status_code=500, detail=f"Failed to load scoring output: {str(e)}")
+    scoring_file = get_job_file_path(jobId, "scoring.json")
+    data = load_json_file(scoring_file)
+    if data:
+        scoring = data.get("scoring", {}) if isinstance(data, dict) else {}
+        return {"ok": True, "scoring": scoring}
     else:
         raise HTTPException(status_code=404, detail="Scoring output not found. Please run recompute first.")
 
@@ -2454,15 +2636,11 @@ async def get_scoring_output(jobId: str) -> Dict[str, Any]:
 @app.get("/api/jobs/{jobId}/rubric-comments")
 async def get_rubric_comments(jobId: str) -> Dict[str, Any]:
     """Get saved rubric component comments for a job."""
-    comments_file = PAGES_ISSUES_DIR / f"{jobId}_rubric_comments.json"
-    if comments_file.exists():
-        try:
-            with open(comments_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                return {"ok": True, "comments": data.get("comments", {})}
-        except Exception as e:
-            print(f"Error loading rubric comments: {e}")
-            raise HTTPException(status_code=500, detail=f"Failed to load rubric comments: {str(e)}")
+    comments_file = get_job_file_path(jobId, "rubric_comments.json")
+    data = load_json_file(comments_file)
+    if data:
+        comments = data.get("comments", {}) if isinstance(data, dict) else {}
+        return {"ok": True, "comments": comments}
     else:
         raise HTTPException(status_code=404, detail="Rubric comments not found.")
 
@@ -2470,41 +2648,32 @@ async def get_rubric_comments(jobId: str) -> Dict[str, Any]:
 @app.delete("/api/jobs/{jobId}/scoring/summary-comment")
 async def delete_summary_comment(jobId: str) -> Dict[str, Any]:
     """Delete the summary comment from scoring output."""
-    scoring_file = PAGES_ISSUES_DIR / f"{jobId}_scoring.json"
-    if scoring_file.exists():
-        try:
-            with open(scoring_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            
-            # Clear summary_comment
-            if "scoring" in data:
-                data["scoring"]["summary_comment"] = ""
-            
-            # Save back
-            with open(scoring_file, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
-            
-            return {"ok": True, "message": "Summary comment deleted successfully"}
-        except Exception as e:
-            print(f"Error deleting summary comment: {e}")
-            raise HTTPException(status_code=500, detail=f"Failed to delete summary comment: {str(e)}")
-    else:
+    scoring_file = get_job_file_path(jobId, "scoring.json")
+    data = load_json_file(scoring_file)
+    
+    if not data:
         raise HTTPException(status_code=404, detail="Scoring output not found.")
+    
+    # Clear summary_comment
+    if isinstance(data, dict) and "scoring" in data:
+        data["scoring"]["summary_comment"] = ""
+    
+    if save_json_file(scoring_file, data):
+        return {"ok": True, "message": "Summary comment deleted successfully"}
+    else:
+        raise HTTPException(status_code=500, detail="Failed to delete summary comment")
 
 
 @app.post("/api/jobs/{jobId}/rubric-comments")
 async def save_rubric_comments(jobId: str, request: Dict[str, Any] = Body(default={})) -> Dict[str, Any]:
     """Save rubric component comments for a job."""
     comments = request.get("comments", {})
-    comments_file = PAGES_ISSUES_DIR / f"{jobId}_rubric_comments.json"
+    comments_file = get_job_file_path(jobId, "rubric_comments.json")
     
-    try:
-        with open(comments_file, "w", encoding="utf-8") as f:
-            json.dump({"job_id": jobId, "comments": comments}, f, indent=2, ensure_ascii=False)
+    if save_json_file(comments_file, {"job_id": jobId, "comments": comments}):
         return {"ok": True, "message": "Rubric comments saved successfully"}
-    except Exception as e:
-        print(f"Error saving rubric comments: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to save rubric comments: {str(e)}")
+    else:
+        raise HTTPException(status_code=500, detail="Failed to save rubric comments")
 
 
 @app.post("/api/save-issue-scores")
@@ -2517,16 +2686,12 @@ async def save_issue_scores(request: Dict[str, Any]) -> Dict[str, Any]:
     if not job_id or not issue_id or not scores:
         raise HTTPException(status_code=400, detail="jobId, issueId, and scores are required")
     
-    issue_scores_file = PAGES_ISSUES_DIR / f"{job_id}_issue_scores.json"
+    issue_scores_file = get_job_file_path(job_id, "issue_scores.json")
     
     # Load existing issue scores
-    issue_scores_data = {}
-    if issue_scores_file.exists():
-        try:
-            with open(issue_scores_file, "r", encoding="utf-8") as f:
-                issue_scores_data = json.load(f)
-        except Exception as e:
-            print(f"Error loading issue scores: {e}")
+    issue_scores_data = load_json_file(issue_scores_file, {})
+    if not isinstance(issue_scores_data, dict):
+        issue_scores_data = {}
     
     # Update scores for this issue
     if "issues" not in issue_scores_data:
@@ -2534,9 +2699,7 @@ async def save_issue_scores(request: Dict[str, Any]) -> Dict[str, Any]:
     issue_scores_data["issues"][issue_id] = scores
     issue_scores_data["lastUpdated"] = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
     
-    try:
-        with open(issue_scores_file, "w", encoding="utf-8") as f:
-            json.dump(issue_scores_data, f, indent=2, ensure_ascii=False)
+    if save_json_file(issue_scores_file, issue_scores_data):
         
         return {
             "status": "success",
@@ -2544,24 +2707,17 @@ async def save_issue_scores(request: Dict[str, Any]) -> Dict[str, Any]:
             "issueId": issue_id,
             "scores": scores,
         }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error saving issue scores: {str(e)}")
+    else:
+        raise HTTPException(status_code=500, detail="Error saving issue scores")
 
 
 @app.get("/api/jobs/{jobId}/issue-scores")
 async def get_issue_scores(jobId: str) -> Dict[str, Any]:
     """Get saved issue scores for a job."""
-    issue_scores_file = PAGES_ISSUES_DIR / f"{jobId}_issue_scores.json"
-    if issue_scores_file.exists():
-        try:
-            with open(issue_scores_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                return {"ok": True, "issues": data.get("issues", {})}
-        except Exception as e:
-            print(f"Error loading issue scores: {e}")
-            raise HTTPException(status_code=500, detail=f"Failed to load issue scores: {str(e)}")
-    else:
-        return {"ok": True, "issues": {}}
+    issue_scores_file = get_job_file_path(jobId, "issue_scores.json")
+    data = load_json_file(issue_scores_file, {})
+    issues = data.get("issues", {}) if isinstance(data, dict) else {}
+    return {"ok": True, "issues": issues}
 
 
 @app.post("/api/save-grading-scores")
@@ -2573,19 +2729,60 @@ async def save_grading_scores(request: Dict[str, Any]) -> Dict[str, Any]:
     if not job_id or not scores:
         raise HTTPException(status_code=400, detail="jobId and scores are required")
     
-    scores_file = PAGES_ISSUES_DIR / f"{job_id}_scores.json"
+    scores_file = get_job_file_path(job_id, "scores.json")
+    data = {"scores": scores, "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())}
     
-    try:
-        with open(scores_file, "w", encoding="utf-8") as f:
-            json.dump({"scores": scores, "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())}, f, indent=2, ensure_ascii=False)
-        
+    if save_json_file(scores_file, data):
         return {
             "status": "success",
             "jobId": job_id,
             "scores": scores,
         }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error saving scores: {str(e)}")
+    else:
+        raise HTTPException(status_code=500, detail="Error saving scores")
+
+
+@app.get("/api/get-final-grade")
+async def get_final_grade(jobId: str = Query(...)) -> Dict[str, Any]:
+    """Get final grade for a job. Returns 404 if no final grade exists."""
+    final_grade_file = get_job_file_path(jobId, "final_grade.json")
+    data = load_json_file(final_grade_file)
+    
+    if not data:
+        raise HTTPException(status_code=404, detail="Final grade not found")
+    
+    return {
+        "finalGrade": data.get("finalGrade"),
+        "overallFeedback": data.get("overallFeedback"),
+        "timestamp": data.get("timestamp"),
+    }
+
+
+@app.post("/api/save-final-grade")
+async def save_final_grade(request: Dict[str, Any]) -> Dict[str, Any]:
+    """Save final grade for a job."""
+    job_id = request.get("jobId")
+    final_grade = request.get("finalGrade")
+    overall_feedback = request.get("overallFeedback", "")
+    
+    if not job_id or final_grade is None:
+        raise HTTPException(status_code=400, detail="jobId and finalGrade are required")
+    
+    final_grade_file = get_job_file_path(job_id, "final_grade.json")
+    data = {
+        "finalGrade": final_grade,
+        "overallFeedback": overall_feedback,
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
+    }
+    
+    if save_json_file(final_grade_file, data):
+        return {
+            "status": "success",
+            "jobId": job_id,
+            "finalGrade": final_grade,
+        }
+    else:
+        raise HTTPException(status_code=500, detail="Error saving final grade")
 
 
 @app.patch("/api/update-page-review")
@@ -2649,6 +2846,324 @@ async def update_page_review(jobId: str, pageId: str, request: Dict[str, Any]) -
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error updating page review: {str(e)}")
+
+
+@app.patch("/api/update-page-metadata")
+async def update_page_metadata(request: Dict[str, Any]) -> Dict[str, Any]:
+    """Update page metadata (main_heading, has_annotations, rubric_relevance) for a specific page."""
+    job_id = request.get("jobId")
+    page_id = request.get("pageId")
+    main_heading = request.get("main_heading")
+    has_annotations = request.get("has_annotations")
+    rubric_relevance = request.get("rubric_relevance")
+    
+    if not job_id or not page_id:
+        raise HTTPException(status_code=400, detail="jobId and pageId are required")
+    
+    pages_file = PAGES_ISSUES_DIR / f"{job_id}_pages.json"
+    
+    if not pages_file.exists():
+        raise HTTPException(status_code=404, detail="Pages file not found. Please run analysis first.")
+    
+    try:
+        with open(pages_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            # Handle both formats: {"pages": [...]} and [...]
+            if isinstance(data, list):
+                pages = data
+            elif isinstance(data, dict):
+                pages = data.get("pages", [])
+            else:
+                pages = []
+        
+        if not pages:
+            raise HTTPException(status_code=404, detail="No pages found in pages.json")
+        
+        # Find and update the page
+        page_found = False
+        for page in pages:
+            if page.get("page_id") == page_id:
+                if main_heading is not None:
+                    page["main_heading"] = main_heading if main_heading else None
+                if has_annotations is not None:
+                    page["has_annotations"] = has_annotations
+                if rubric_relevance is not None:
+                    # Merge with existing rubric_relevance to preserve fields not being updated
+                    if "rubric_relevance" not in page:
+                        page["rubric_relevance"] = {}
+                    page["rubric_relevance"].update(rubric_relevance)
+                page_found = True
+                break
+        
+        if not page_found:
+            available_page_ids = [p.get("page_id", "N/A") for p in pages[:5]]
+            print(f"[DEBUG] Page {page_id} not found. Available page_ids (first 5): {available_page_ids}")
+            raise HTTPException(status_code=404, detail=f"Page {page_id} not found. Available pages: {len(pages)}")
+        
+        # Save back - use the same format as get_pages (direct array)
+        with open(pages_file, "w", encoding="utf-8") as f:
+            json.dump(pages, f, indent=2, ensure_ascii=False)
+        
+        return {
+            "status": "success",
+            "jobId": job_id,
+            "pageId": page_id,
+            "message": "Page metadata updated successfully",
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[ERROR] Error updating page metadata: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Error updating page metadata: {str(e)}")
+
+
+@app.post("/api/reanalyze-page-with-role")
+async def reanalyze_page_with_role(request: Dict[str, Any]) -> Dict[str, Any]:
+    """Update page_role for a page and reanalyze it with the new role."""
+    job_id = request.get("jobId")
+    page_id = request.get("pageId")
+    new_page_role = request.get("page_role")
+    heuristic_id = request.get("heuristic_id")  # Optional: for heuristic_explainer pages
+    
+    if not job_id or not page_id or not new_page_role:
+        raise HTTPException(status_code=400, detail="jobId, pageId, and page_role are required")
+    
+    # Valid page roles
+    valid_roles = ["intro", "group_collab", "heuristic_explainer", "violation_detail", 
+                   "severity_summary", "conclusion", "ai_opportunities", "other"]
+    if new_page_role not in valid_roles:
+        raise HTTPException(status_code=400, detail=f"Invalid page_role. Must be one of: {valid_roles}")
+    
+    # If switching to heuristic_explainer, heuristic_id is required
+    if new_page_role == "heuristic_explainer" and not heuristic_id:
+        raise HTTPException(status_code=400, detail="heuristic_id is required when page_role is 'heuristic_explainer'")
+    
+    # Validate heuristic_id format (H1-H10)
+    if heuristic_id:
+        if not (heuristic_id.startswith("H") and len(heuristic_id) >= 2):
+            raise HTTPException(status_code=400, detail="Invalid heuristic_id format. Must be H1-H10")
+        try:
+            heuristic_num = int(heuristic_id[1:].split("_")[0])
+            if heuristic_num < 1 or heuristic_num > 10:
+                raise HTTPException(status_code=400, detail="heuristic_id must be H1-H10")
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid heuristic_id format. Must be H1-H10")
+    
+    try:
+        # Load pages to find the page
+        pages_file = PAGES_ISSUES_DIR / f"{job_id}_pages.json"
+        if not pages_file.exists():
+            raise HTTPException(status_code=404, detail="Pages file not found. Please run analysis first.")
+        
+        with open(pages_file, "r", encoding="utf-8") as f:
+            pages_data = json.load(f)
+            if isinstance(pages_data, list):
+                pages = pages_data
+            elif isinstance(pages_data, dict):
+                pages = pages_data.get("pages", [])
+            else:
+                pages = []
+        
+        # Find the page
+        page_to_update = None
+        for page in pages:
+            if page.get("page_id") == page_id:
+                page_to_update = page
+                break
+        
+        if not page_to_update:
+            raise HTTPException(status_code=404, detail=f"Page {page_id} not found")
+        
+        page_number = page_to_update.get("page_number")
+        
+        # Load extraction data to get original page content
+        extraction_file = ANALYSIS_OUTPUT_DIR.parent / f"{job_id}_extraction.json"
+        if not extraction_file.exists():
+            raise HTTPException(status_code=404, detail="Extraction file not found. Cannot reanalyze without original page data.")
+        
+        with open(extraction_file, "r", encoding="utf-8") as f:
+            extraction_data = json.load(f)
+            extraction_pages = extraction_data.get("pages", [])
+        
+        # Find the original page data
+        original_page = None
+        for ep in extraction_pages:
+            if ep.get("page_number") == page_number:
+                original_page = ep
+                break
+        
+        if not original_page:
+            raise HTTPException(status_code=404, detail=f"Original page {page_number} not found in extraction data")
+        
+        # Get previous pages context for heuristic hint
+        previous_pages_context = []
+        for p in pages:
+            if p.get("page_number", 0) < page_number:
+                prev_page_data = {
+                    "page_number": p.get("page_number"),
+                    "page_role": p.get("page_role"),
+                    "main_heading": p.get("main_heading", ""),
+                    "fragments": p.get("fragments", []),
+                    "page_content": "",  # We'll get this from extraction if needed
+                }
+                # Try to get page content from extraction
+                for ep in extraction_pages:
+                    if ep.get("page_number") == p.get("page_number"):
+                        prev_page_data["page_content"] = ep.get("snippet", "")
+                        break
+                # Only include heuristic_explainer pages
+                if prev_page_data["page_role"] == "heuristic_explainer":
+                    previous_pages_context.append(prev_page_data)
+        
+        # Prepare page data for analysis
+        page_data = {
+            "pageNumber": page_number,
+            "snippet": original_page.get("snippet", ""),
+            "imageBase64": original_page.get("image_base64"),
+        }
+        
+        # Call analyze-single-page logic
+        if not GEMINI_API_KEY:
+            raise HTTPException(status_code=500, detail="GEMINI_API_KEY not configured")
+        
+        if not MODEL:
+            raise HTTPException(status_code=500, detail="Gemini model not initialized")
+        
+        snippet = page_data.get("snippet", "")
+        image_base64 = page_data.get("imageBase64")
+        has_image = bool(image_base64)
+        
+        # Use new structured page analysis prompt
+        truncated_content = snippet[:2500] + ("..." if len(snippet) > 2500 else "")
+        prompt = get_page_analysis_prompt(page_number, truncated_content, has_image, previous_pages_context)
+        
+        # Prepare content for Gemini
+        content_parts = [prompt]
+        
+        # If we have an image, include it
+        if image_base64:
+            # Remove data URL prefix if present
+            if image_base64.startswith("data:image"):
+                image_base64 = image_base64.split(",")[1]
+            
+            image_bytes = base64.b64decode(image_base64)
+            pil_image = Image.open(io.BytesIO(image_bytes))
+            
+            # Compress image
+            max_width = 1200
+            if pil_image.width > max_width:
+                ratio = max_width / pil_image.width
+                new_height = int(pil_image.height * ratio)
+                pil_image = pil_image.resize((max_width, new_height), Image.Resampling.LANCZOS)
+            
+            content_parts.append(pil_image)
+        
+        # Call Gemini
+        generation_config = {
+            "temperature": 0.2,
+            "max_output_tokens": 8192,
+            "response_mime_type": "application/json",
+        }
+        
+        response = MODEL.generate_content(content_parts, generation_config=generation_config)
+        
+        # Parse response
+        if not response.candidates or len(response.candidates) == 0:
+            raise HTTPException(status_code=500, detail="No response from Gemini API")
+        
+        candidate = response.candidates[0]
+        if hasattr(candidate, 'finish_reason') and candidate.finish_reason != 1:
+            raise HTTPException(status_code=500, detail=f"Gemini API error: finish_reason={candidate.finish_reason}")
+        
+        response_text = response.text
+        
+        # Parse JSON response
+        try:
+            structured_analysis = json.loads(response_text)
+        except json.JSONDecodeError as e:
+            # Try to extract JSON from markdown
+            import re
+            json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+            if json_match:
+                structured_analysis = json.loads(json_match.group())
+            else:
+                raise HTTPException(status_code=500, detail=f"Failed to parse JSON response: {str(e)}")
+        
+        # Override page_role with the new one
+        structured_analysis["page_role"] = new_page_role
+        
+        # If switching to heuristic_explainer and heuristic_id is provided, add a fragment with that heuristic
+        if new_page_role == "heuristic_explainer" and heuristic_id:
+            # Create a fragment for the heuristic explainer page
+            fragment = {
+                "heuristic_id": heuristic_id,
+                "issue_key": f"heuristic_{heuristic_id.lower()}_explanation",
+                "fragment_role": ["design_rationale"],
+                "text_summary": f"This page explains {heuristic_id} (Nielsen's Heuristic {heuristic_id[1:]}).",
+                "rubric_tags": ["coverage"]
+            }
+            # Set fragments to contain this single fragment
+            structured_analysis["fragments"] = [fragment]
+        
+        # Save the analysis result
+        analysis_file = ANALYSIS_OUTPUT_DIR / f"{job_id}_page_{page_number}.json"
+        analysis_result = {
+            "page_number": page_number,
+            "structured_analysis": structured_analysis,
+        }
+        with open(analysis_file, "w", encoding="utf-8") as f:
+            json.dump(analysis_result, f, indent=2, ensure_ascii=False)
+        
+        # Update pages.json
+        for page in pages:
+            if page.get("page_id") == page_id:
+                # Update with new analysis
+                page.update(structured_analysis)
+                page["page_id"] = page_id  # Preserve page_id
+                break
+        
+        with open(pages_file, "w", encoding="utf-8") as f:
+            json.dump(pages, f, indent=2, ensure_ascii=False)
+        
+        # Regenerate issues.json
+        issues = aggregate_issues(pages)
+        issues_file = PAGES_ISSUES_DIR / f"{job_id}_issues.json"
+        
+        # Preserve TA reviews from existing issues
+        existing_issues = []
+        if issues_file.exists():
+            try:
+                with open(issues_file, "r", encoding="utf-8") as f:
+                    existing_issues_data = json.load(f)
+                    existing_issues = existing_issues_data.get("issues", [])
+            except Exception:
+                pass
+        
+        existing_issues_dict = {issue.get("issue_id"): issue for issue in existing_issues}
+        for issue in issues:
+            existing_issue = existing_issues_dict.get(issue["issue_id"])
+            if existing_issue and existing_issue.get("ta_review"):
+                issue["ta_review"] = existing_issue["ta_review"]
+        
+        with open(issues_file, "w", encoding="utf-8") as f:
+            json.dump({"issues": issues}, f, indent=2, ensure_ascii=False)
+        
+        return {
+            "status": "success",
+            "jobId": job_id,
+            "pageId": page_id,
+            "page": structured_analysis,
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[ERROR] Error reanalyzing page: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Error reanalyzing page: {str(e)}")
 
 
 @app.get("/api/get-pages")
@@ -2922,7 +3437,7 @@ async def delete_submission(jobId: str) -> Dict[str, Any]:
         extraction_file.unlink()
         deleted_files.append("extraction")
     
-    # Delete analysis results
+    # Delete analysis results (page analysis JSON files)
     analysis_files = list(ANALYSIS_OUTPUT_DIR.glob(f"{jobId}_page_*.json"))
     for analysis_file in analysis_files:
         analysis_file.unlink()
@@ -2933,6 +3448,41 @@ async def delete_submission(jobId: str) -> Dict[str, Any]:
     if overrides_file.exists():
         overrides_file.unlink()
         deleted_files.append("overrides")
+    
+    # Delete pages and issues JSON files (from issue reviewer)
+    pages_file = PAGES_ISSUES_DIR / f"{jobId}_pages.json"
+    if pages_file.exists():
+        pages_file.unlink()
+        deleted_files.append("pages")
+    
+    issues_file = PAGES_ISSUES_DIR / f"{jobId}_issues.json"
+    if issues_file.exists():
+        issues_file.unlink()
+        deleted_files.append("issues")
+    
+    # Delete scores JSON file
+    scores_file = PAGES_ISSUES_DIR / f"{jobId}_scores.json"
+    if scores_file.exists():
+        scores_file.unlink()
+        deleted_files.append("scores")
+    
+    # Delete scoring output JSON file
+    scoring_file = PAGES_ISSUES_DIR / f"{jobId}_scoring.json"
+    if scoring_file.exists():
+        scoring_file.unlink()
+        deleted_files.append("scoring")
+    
+    # Delete rubric comments JSON file
+    rubric_comments_file = PAGES_ISSUES_DIR / f"{jobId}_rubric_comments.json"
+    if rubric_comments_file.exists():
+        rubric_comments_file.unlink()
+        deleted_files.append("rubric_comments")
+    
+    # Delete prompt improvement analysis JSON file (if exists)
+    prompt_analysis_file = PAGES_ISSUES_DIR / f"{jobId}_prompt_improvement_analysis.json"
+    if prompt_analysis_file.exists():
+        prompt_analysis_file.unlink()
+        deleted_files.append("prompt_improvement_analysis")
     
     return {
         "status": "success",
@@ -2955,6 +3505,8 @@ refinement_sessions: Dict[str, Dict[str, Any]] = {}
 
 # Path to grading prompt file (primary prompt for grading)
 GRADING_PROMPT_FILE = Path(__file__).parent.parent / "output_static" / "grading_prompt.txt"
+# Backup path for prompt (never modified by code, only by user manually)
+GRADING_PROMPT_BACKUP_FILE = Path(__file__).parent.parent / "output_static" / "grading_prompt_backup.txt"
 # Legacy path for backward compatibility
 SAVED_PROMPT_FILE = Path(__file__).parent.parent / "output_static" / "saved_prompt.txt"
 
@@ -3582,10 +4134,124 @@ def aggregate_issues(pages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return issues
 
 
-def get_page_analysis_prompt(page_number: int, page_content: str, has_image: bool) -> str:
-    """Generate prompt for structured page analysis (PageAnalysis format)."""
+def get_page_analysis_prompt(page_number: int, page_content: str, has_image: bool, previous_pages_context: Optional[List[Dict[str, Any]]] = None) -> str:
+    """Generate prompt for structured page analysis (PageAnalysis format).
+    
+    Args:
+        page_number: Current page number
+        page_content: Content of current page
+        has_image: Whether page has an image
+        previous_pages_context: List of previous pages' analysis results, each containing:
+            - page_number: Page number
+            - page_role: Role of the page (e.g., "heuristic_explainer", "violation_detail")
+            - main_heading: Main heading of the page (if available)
+            - fragments: List of fragments (for heuristic_explainer pages, this may contain heuristic info)
+    """
     word_count = len(page_content.split())
     image_note = "with screenshot/image" if has_image else "text only"
+    
+    # Build context hint from previous pages
+    heuristic_hint = ""
+    if previous_pages_context:
+        # Find the most recent heuristic_explainer page (closest to current page)
+        for prev_page in reversed(previous_pages_context):
+            if prev_page.get("page_role") == "heuristic_explainer":
+                prev_page_num = prev_page.get("page_number", "?")
+                prev_heading = prev_page.get("main_heading", "")
+                prev_content = prev_page.get("page_content", "")  # Original page content
+                
+                import re
+                heuristic_id_from_heading = None
+                heuristic_id_from_content = None
+                heuristic_from_fragments = None
+                
+                # Method 1: Try to extract heuristic from main_heading (most reliable if available)
+                if prev_heading:
+                    patterns = [
+                        r'[Hh]euristic\s*#?\s*(\d+)',  # "Heuristic 1", "Heuristic #1", "Heuristic: 1"
+                        r'^[Hh](\d+)\s*[:\-]',  # "H1:", "H1 -"
+                        r'^[Hh](\d+)\s*$',  # Just "H1"
+                        r'[Hh]euristic\s+(\d+)',  # "Heuristic 1" with space
+                    ]
+                    for pattern in patterns:
+                        match = re.search(pattern, prev_heading)
+                        if match:
+                            heuristic_num = match.group(1)
+                            if heuristic_num.isdigit() and 1 <= int(heuristic_num) <= 10:
+                                heuristic_id_from_heading = f"H{heuristic_num}"
+                                break
+                
+                # Method 2: Try to extract from page content (more reliable than fragments)
+                # Search in the first 500 characters of the page content
+                if prev_content and not heuristic_id_from_heading:
+                    content_snippet = prev_content[:500]  # First 500 chars should contain heuristic info
+                    patterns = [
+                        r'[Hh]euristic\s*#?\s*(\d+)',  # "Heuristic 1", "Heuristic #1"
+                        r'\b[Hh](\d+)\b',  # "H1" as word boundary
+                        r'[Hh]euristic\s+(\d+)',  # "Heuristic 1" with space
+                    ]
+                    for pattern in patterns:
+                        match = re.search(pattern, content_snippet)
+                        if match:
+                            heuristic_num = match.group(1)
+                            if heuristic_num.isdigit() and 1 <= int(heuristic_num) <= 10:
+                                heuristic_id_from_content = f"H{heuristic_num}"
+                                break
+                
+                # Method 3: Try fragments as fallback (less reliable for explainer pages)
+                fragments = prev_page.get("fragments", [])
+                if fragments:
+                    for frag in fragments:
+                        heuristic_id = frag.get("heuristic_id", "")
+                        if heuristic_id and heuristic_id.startswith("H") and len(heuristic_id) >= 2:
+                            # Check if it's a valid heuristic (H1-H10)
+                            num_str = heuristic_id[1:].split("_")[0]
+                            if num_str.isdigit() and 1 <= int(num_str) <= 10:
+                                heuristic_from_fragments = heuristic_id
+                                break
+                
+                # Priority: heading > content > fragments
+                final_heuristic_id = heuristic_id_from_heading or heuristic_id_from_content or heuristic_from_fragments
+                
+                if final_heuristic_id:
+                    heuristic_hint = f"""
+
+**CONTEXT HINT FOR HEURISTIC IDENTIFICATION (OPTIONAL - ONLY IF APPLICABLE):**
+The previous page (Page {prev_page_num}) is a "heuristic_explainer" page that introduces {final_heuristic_id}. 
+
+**IMPORTANT RULES FOR USING THIS HINT:**
+1. This hint is OPTIONAL and should ONLY be used if:
+   - The current page (Page {page_number}) is classified as "violation_detail" AND
+   - The current page does NOT have a clear title, subtitle, or heading that explicitly identifies a heuristic (e.g., "Heuristic 1", "H1", "Visibility of System Status") AND
+   - The current page's content does NOT clearly mention a specific heuristic
+
+2. DO NOT use this hint if:
+   - The current page explicitly mentions a DIFFERENT heuristic in its title/heading/subtitle/content
+   - The current page's content clearly discusses a different heuristic than {final_heuristic_id}
+   - The current page is NOT a "violation_detail" page
+   - The current page has ANY explicit heuristic identification (even if different from the hint)
+
+3. When the hint applies:
+   - Use {final_heuristic_id} as the heuristic_id for fragments on this page
+   - This hint continues to apply to subsequent violation_detail pages UNTIL a new heuristic_explainer page appears
+
+4. CRITICAL: Always verify the page content first. If the page content clearly indicates ANY heuristic (even if different from the hint), use that instead of the hint.
+
+**SPECIAL CASE: Pages with only screenshots and minimal text:**
+- If the current page has a screenshot/image but very little or no explanatory text describing the heuristic or violation, check adjacent pages (previous or next) for heuristic context.
+- If the previous page (Page {prev_page_num}) is a "heuristic_explainer" or "violation_detail" page that discusses a specific heuristic, that heuristic likely applies to the current screenshot page as well.
+- Similarly, if the next page (not yet analyzed) appears to contain explanation text for the screenshot, the heuristic from the previous context or the next page's context may apply.
+- **IMPORTANT: If the current page only has a screenshot with minimal text, and the explanation is on the next page, you should still use the hint from the previous heuristic_explainer page if available. The screenshot page and its explanation page often belong to the same heuristic context.**
+- In such cases, use the hint from the previous heuristic_explainer page if available, as screenshots are often placed on separate pages from their explanations.
+
+**NOTE: If no hint is provided above, or if the hint does not apply, you must determine the heuristic_id from the current page's own content using the steps below.**"""
+                break
+    
+    # Add note if no hint was found
+    if not heuristic_hint:
+        heuristic_hint = """
+
+**NOTE: No heuristic_explainer page was found before this page. You must determine the heuristic_id entirely from the current page's own content using the steps below.**"""
     
     prompt = f"""You are analyzing a single page from a student's heuristic evaluation assignment. Your task is to extract structured information about what this page contains and how it relates to the grading rubric.
 
@@ -3593,7 +4259,7 @@ PAGE CONTENT:
 Page {page_number} ({word_count} words, {image_note})
 ---
 {page_content[:2500]}
----
+---{heuristic_hint}
 
 NIELSEN HEURISTICS REFERENCE:
 1. Visibility of System Status
@@ -3662,6 +4328,8 @@ RULES:
    - "heuristic_explainer": Defines Nielsen's heuristics generically (not site-specific)
    - "violation_detail": Analyzes specific problems on target website (with screenshots/bullets)
    - "severity_summary": Summarizes severity across issues (tables/plots)
+     **IMPORTANT: If a page contains a table that mentions multiple heuristics (e.g., a table listing Heuristic 1, Heuristic 2, Heuristic 3, etc. with their severity ratings or summaries), it should be classified as "severity_summary". Pages with tables summarizing multiple heuristics are typically summary pages, not detailed violation analysis pages.**
+     **EXCEPTION: If a page is a title/subtitle page (contains only 1-7 words total, typically just a heading like "Findings by Heuristic" or "Introduction" with minimal or no other content), it should be classified as "other" (title/subtitle page). Count ALL words on the page - if the total word count is 1-7 words, classify as "other" regardless of whether it contains a table or other visual elements.**
    - "conclusion": Conclusions, reflections, limitations, learnings, next steps
    - "ai_opportunities": Page mainly discusses how AI, machine learning, chatbots, recommendation systems, etc. could be used to address the problems found on the Julian site. The page should propose concrete AI solutions tied to specific violations or usability issues.
    - "other": Doesn't fit above
@@ -3686,6 +4354,7 @@ RULES:
    - professional_quality: Layout, visual design, information hierarchy, overall slide professionalism.
      Examples: Well-organized layout with color/alignment emphasizing structure → "high".
      Text blends into background, high saturation colors, irrelevant patterns affecting readability → "low".
+     Very disorganized or distracting layout → "none".
    - writing_quality: Is text clear, logical, with grammar/spelling that doesn't hinder understanding?
      Examples: Long analysis written clearly → "high"; grammar errors, simple sentences → "med"; pure bullets, incomplete sentences → "low".
 
@@ -3695,6 +4364,56 @@ RULES:
    - Even if a conclusion or intro page mentions heuristics or issues, do NOT create fragments for them
    - One fragment = "this page says something substantive about one heuristic + one issue"
    - heuristic_id: "H1" to "H10" (or "Hx_unknown" if unclear)
+   
+   **CRITICAL: Determining heuristic_id for violation_detail pages (READ CAREFULLY):**
+   
+   **IMPORTANT: The following steps apply REGARDLESS of whether a CONTEXT HINT is provided above. Always follow this priority order.**
+   
+   **Step 1: Check the current page itself FIRST (HIGHEST PRIORITY - ALWAYS DO THIS FIRST)**
+   - Look for explicit heuristic identification in:
+     * Page title/heading (e.g., "Heuristic 1", "H1", "Visibility of System Status", "Heuristic #1")
+     * Subtitle or section header
+     * First paragraph that mentions "Heuristic X" or a heuristic name
+     * Any clear mention of heuristic numbers (1-10) or heuristic names in the page content
+   - If found, use that heuristic_id. DO NOT use any hint if the page explicitly identifies a heuristic.
+   - This step takes ABSOLUTE PRIORITY over any hint.
+   
+   **Step 2: Check page content thoroughly for heuristic mentions (SECOND PRIORITY)**
+   - Read the ENTIRE page content carefully for any mention of:
+     * Heuristic numbers (1-10) in any format ("Heuristic 1", "H1", "Heuristic #1", etc.)
+     * Heuristic names (e.g., "Visibility of System Status", "Error Prevention", etc.)
+     * References to specific Nielsen heuristics
+   - If the content clearly discusses a specific heuristic, use that heuristic_id
+   - If the content mentions multiple heuristics, assign each fragment to the appropriate heuristic based on context
+   - Search for patterns like "Heuristic X", "HX", "Heuristic #X" where X is 1-10
+   
+   **Step 3: Use CONTEXT HINT only if Steps 1-2 found NOTHING (LOWEST PRIORITY - OPTIONAL)**
+   - ONLY use the hint if:
+     * The current page has NO explicit heuristic identification in title/heading/subtitle AND
+     * The page content does NOT clearly mention any specific heuristic (no numbers 1-10, no heuristic names) AND
+     * A CONTEXT HINT is provided above (if no hint is provided, skip to Step 4)
+   - If all conditions are met, use the heuristic from the hint
+   - REMEMBER: The hint applies to this page and subsequent violation_detail pages until a new heuristic_explainer appears
+   - If ANY of the conditions are not met, DO NOT use the hint
+   
+   **Step 4: Last resort (ONLY if Steps 1-3 found nothing)**
+   - If no explicit identification, no content mention, and no applicable hint: use "Hx_unknown"
+   - This should be RARE - most pages will have some heuristic identification
+   
+   **VERIFICATION RULE (CRITICAL - APPLY BEFORE EVERY heuristic_id ASSIGNMENT):**
+   - Before assigning heuristic_id, ask: "Does this page's content clearly indicate ANY heuristic (even if different from the hint)?"
+   - If YES → use the heuristic indicated by the content (ignore the hint completely)
+   - If NO → check if hint is available and applicable, then use hint
+   - If NO hint or hint not applicable → use "Hx_unknown"
+   - NEVER blindly use the hint if the page content contradicts it or provides any heuristic information
+   
+   **SCENARIOS TO HANDLE:**
+   - Scenario A: Page has explicit heuristic in title → Use that heuristic (ignore hint)
+   - Scenario B: Page has no title but content mentions "Heuristic 3" → Use H3 (ignore hint)
+   - Scenario C: Page has no title, no content mention, but hint says H2 → Use H2 from hint
+   - Scenario D: Page has no title, no content mention, no hint → Use "Hx_unknown"
+   - Scenario E: Page has title "Heuristic 1" but hint says H2 → Use H1 from title (ignore hint)
+   
    - issue_key: 2-6 words, lowercase, snake_case (e.g., "search_bar_mobile_hidden")
    - fragment_role: 1-3 roles from [problem_description, impact, evidence, design_rationale, fix_idea]
    - text_summary: 1-2 sentences, paraphrase (NO copy-paste)
@@ -3720,7 +4439,52 @@ RULES:
      * "somewhat_specific": Some details but also generic statements
      * "generic": Mostly "AI can improve everything" without concrete mechanisms
 
-6. Keep it compact:
+6. has_annotations: Only evaluate for pages with page_role === "violation_detail" and has_image === true. For other pages, set to "none".
+   **IMPORTANT: Annotations are SHORT TEXT MARKINGS or VISUAL MARKINGS that point to problems ON or IMMEDIATELY ADJACENT to the screenshot. Do NOT confuse annotations with the detailed analysis text below the screenshot.**
+   
+   Annotations are SHORT markers that directly point to problems on the screenshot:
+   - Visual markings ON the screenshot: red boxes, squares, rectangles, borders, arrows, lines, circles, highlights, underlines drawn directly on the image
+   - Short text labels ON or IMMEDIATELY ADJACENT to the screenshot: brief labels, numbers, short notes (e.g., "Issue 1", "Problem here", "Missing button") placed on the image or right next to it
+   
+   **CRITICAL: What does NOT count as annotation:**
+   - Detailed analysis paragraphs below the screenshot (these are part of the violation description, not annotations)
+   - Long explanatory text that analyzes the screenshot content
+   - Any text that is part of the main body content describing the violation
+   
+   **What DOES count as annotation:**
+   - Short text labels/notes drawn ON the screenshot itself
+   - Short text labels placed immediately next to or adjacent to the screenshot (e.g., "Issue 1", "Problem", "Missing")
+   - Visual markings (boxes, arrows, circles) on the screenshot
+   - Brief callouts or pointers that directly reference specific elements in the screenshot
+   
+   Rating levels (BE GENEROUS AND LENIENT):
+    - "high": Screenshots show clear visual markings OR multiple short text labels that point to problems
+      (e.g., multiple boxes/arrows/circles with short labels like "Issue 1", "Problem here", or clear callouts)
+      **BE GENEROUS: If there are 2+ visual markings OR 2+ text labels, consider "high"**
+    - "medium": There are visible markings OR some short text labels on the screenshot or immediately adjacent
+      (e.g., one or a few boxes/arrows/highlights, or a few short labels like "Issue 1", "Missing button")
+      **BE GENEROUS: If there is ANY visual marking OR ANY text label, strongly consider "medium"**
+    - "low": There is at least one simple marking OR one brief text label OR any indication that the student attempted to mark the screenshot
+      (e.g., a single box/arrow/circle, one short label like "Problem" or "Issue", or even a subtle highlight or underline)
+      **BE GENEROUS: If there is ANY visible attempt to mark or label the screenshot, use "low" instead of "none"**
+    - "none": ONLY use this when screenshots are completely unmarked with NO visual markings AND NO text labels anywhere near the screenshot
+      **BE STRICT: Only use "none" if you are absolutely certain there are NO markings, labels, highlights, or any form of annotation attempt**
+ 
+   Key guidelines (BE GENEROUS):
+    - Visual markings (boxes, arrows, circles, borders, frames, highlights, underlines) drawn ON the screenshot → count as annotation
+    - Short text labels ON the screenshot (e.g., "Issue 1", "Problem") → count as annotation
+    - Short text labels immediately adjacent to the screenshot (e.g., "Issue 1" right next to the image) → count as annotation
+    - Even subtle markings (light highlights, faint boxes, small arrows) → count as annotation
+    - Text that appears near the screenshot (even if not directly on it) that references specific elements → consider as annotation
+    - Long explanatory text describing the problem → do NOT count as annotation (but be generous with shorter text near the image)
+    - **GENEROUS RULE: If you can see ANY box, border, frame, highlight, underline, or any visual marking ON the screenshot → at least "low", prefer "medium"**
+    - **GENEROUS RULE: If you can see ANY arrow, line, circle, or highlight ON the screenshot → prefer "medium" or "high"**
+    - **GENEROUS RULE: If you can see ANY short text labels, numbers, or brief notes ON or immediately adjacent to the screenshot → prefer "medium" or "high"**
+    - **GENEROUS RULE: When unsure between two levels, ALWAYS choose the more generous one (e.g., prefer "low" over "none", "medium" over "low", "high" over "medium")**
+    - **GENEROUS RULE: Only use "none" when you are absolutely certain screenshots are completely unmarked (no visual markings AND no short text labels on or adjacent to the screenshot)**
+    - **GENEROUS RULE: If there is ANY indication that the student tried to annotate (even if minimal or subtle), use "low" at minimum**
+
+7. Keep it compact:
    - text_summary ≤ 2 sentences
    - llm_note ≤ 2 sentences
    - At most 5 fragments per page
@@ -4658,7 +5422,7 @@ Each plan should include:
 1. A clear strategy/approach (what's the main idea?)
 2. Specific improvements to make (prioritizing LLM-friendly structures and clear instructions)
 3. Rationale for why this approach would help (especially how it improves LLM comprehension and reduces parsing errors)
-4. Expected benefits (including reduced JSON parsing failures and improved LLM execution reliability)
+4. Expected benefits (including reduced JSON parsing failures and improved LLM execution reliability) - **REQUIRED: Must provide at least 2-3 specific benefits**
 5. Potential risks or trade-offs
 
 OUTPUT FORMAT (JSON):
@@ -4677,7 +5441,9 @@ OUTPUT FORMAT (JSON):
         }}
       ],
       "expected_benefits": [
-        "List of expected benefits"
+        "Benefit 1: Specific improvement this plan will achieve",
+        "Benefit 2: Another concrete benefit",
+        "Benefit 3: Additional advantage"
       ],
       "potential_risks": [
         "List of potential risks or trade-offs"
@@ -4687,6 +5453,8 @@ OUTPUT FORMAT (JSON):
     }}
   ]
 }}
+
+**CRITICAL: Each plan MUST include a non-empty "expected_benefits" array with at least 2-3 specific, concrete benefits. Do NOT leave this field empty or use placeholder text.**
 
 Make sure the plans are DISTINCTLY different - not just variations of the same idea.
 Consider different angles: structural changes, clarity improvements, evaluation criteria refinement, error handling, etc.
@@ -4701,6 +5469,8 @@ Consider different angles: structural changes, clarity improvements, evaluation 
         
         response = MODEL.generate_content(plans_prompt, generation_config=generation_config)
         response_text = response.text.strip()
+        
+        # Clean up potential markdown fences
         if response_text.startswith("```json"):
             response_text = response_text[7:].strip()
         if response_text.startswith("```"):
@@ -4708,10 +5478,137 @@ Consider different angles: structural changes, clarity improvements, evaluation 
         if response_text.endswith("```"):
             response_text = response_text[:-3].strip()
         
-        plans_data = json.loads(response_text)
-        return plans_data.get("plans", [])
+        # Robust JSON parsing with multiple fallback layers
+        plans_data = None
+        try:
+            # First attempt: Direct JSON parsing
+            plans_data = json.loads(response_text)
+        except json.JSONDecodeError as e:
+            print(f"[WARN] Direct JSON parse failed: {e}")
+            error_msg = str(e)
+            
+            # Check if error is about unterminated string
+            if "Unterminated string" in error_msg or "Expecting" in error_msg:
+                print(f"[INFO] Detected unterminated string or malformed JSON, attempting fixes...")
+            
+            # Fallback 1: Extract JSON fragment from response and fix it
+            start = response_text.find("{")
+            end = response_text.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                json_fragment = response_text[start : end + 1]
+                try:
+                    # Try to fix common JSON issues (unterminated strings, missing brackets, etc.)
+                    json_fragment = fix_incomplete_json(json_fragment)
+                    plans_data = json.loads(json_fragment)
+                    print(f"[INFO] Successfully parsed JSON fragment after fixing")
+                except json.JSONDecodeError as e2:
+                    print(f"[WARN] JSON fragment parse also failed: {e2}")
+                    # Fallback 2: More aggressive string termination fix
+                    try:
+                        # Try to fix unterminated strings more aggressively
+                        # Find lines with unterminated strings and close them
+                        lines = json_fragment.split('\n')
+                        fixed_lines = []
+                        for i, line in enumerate(lines):
+                            # Count unescaped quotes in this line
+                            unescaped_quotes = len(re.findall(r'(?<!\\)"', line))
+                            if unescaped_quotes % 2 == 1:
+                                # Odd number of quotes - likely unterminated
+                                # Try to close the string at a reasonable position
+                                if ':' in line and not line.rstrip().endswith('"'):
+                                    # Find the value part after ':'
+                                    colon_pos = line.find(':')
+                                    value_part = line[colon_pos + 1:].strip()
+                                    if value_part.startswith('"') and not value_part.endswith('"'):
+                                        # Unterminated string value, try to close it
+                                        # Find the last non-whitespace character before potential comma/brace
+                                        last_char_pos = len(value_part) - 1
+                                        while last_char_pos >= 0 and value_part[last_char_pos] in ' \t':
+                                            last_char_pos -= 1
+                                        if last_char_pos >= 0 and value_part[last_char_pos] != '"':
+                                            # Add closing quote
+                                            line = line[:colon_pos + 1] + value_part[:last_char_pos + 1] + '"' + line[colon_pos + 1 + last_char_pos + 1:]
+                            fixed_lines.append(line)
+                        
+                        json_fragment = '\n'.join(fixed_lines)
+                        json_fragment = fix_incomplete_json(json_fragment)
+                        plans_data = json.loads(json_fragment)
+                        print(f"[INFO] Successfully parsed after aggressive string fixing")
+                    except json.JSONDecodeError as e3:
+                        print(f"[WARN] Aggressive fixing also failed: {e3}")
+                        # Fallback 3: Try to extract plans array using regex (last resort)
+                        try:
+                            # Try to find the plans array even if JSON is malformed
+                            plans_match = re.search(r'"plans"\s*:\s*\[', response_text, re.DOTALL)
+                            if plans_match:
+                                # Try to extract the array content
+                                start_pos = plans_match.end()
+                                # Find matching closing bracket
+                                bracket_count = 1
+                                end_pos = start_pos
+                                for i in range(start_pos, len(response_text)):
+                                    if response_text[i] == '[':
+                                        bracket_count += 1
+                                    elif response_text[i] == ']':
+                                        bracket_count -= 1
+                                        if bracket_count == 0:
+                                            end_pos = i
+                                            break
+                                
+                                if end_pos > start_pos:
+                                    plans_array_text = response_text[start_pos:end_pos]
+                                    # Try to extract individual plan objects using regex
+                                    plan_objects = []
+                                    # Look for plan objects (simplified pattern)
+                                    plan_pattern = r'\{\s*"plan_id"[^}]*\}'
+                                    for plan_match in re.finditer(plan_pattern, plans_array_text, re.DOTALL):
+                                        try:
+                                            plan_text = plan_match.group(0)
+                                            # Try to fix the plan object
+                                            plan_text = fix_incomplete_json(plan_text)
+                                            plan_obj = json.loads(plan_text)
+                                            plan_objects.append(plan_obj)
+                                        except:
+                                            continue
+                                    if plan_objects:
+                                        plans_data = {"plans": plan_objects}
+                                        print(f"[INFO] Extracted {len(plan_objects)} plans using regex fallback")
+                        except Exception as e4:
+                            print(f"[WARN] Regex extraction also failed: {e4}")
+            
+            # If all parsing attempts failed, raise a more informative error
+            if not plans_data:
+                error_preview = response_text[:1000] if len(response_text) > 1000 else response_text
+                print(f"[ERROR] All JSON parsing attempts failed.")
+                print(f"[ERROR] Original error: {error_msg}")
+                print(f"[ERROR] Response preview (first 1000 chars): {error_preview}")
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Failed to parse LLM response as JSON. The response may contain unterminated strings or malformed JSON. Original error: {error_msg}"
+                )
+        
+        plans = plans_data.get("plans", [])
+        # Validate and ensure expected_benefits exists for each plan
+        for i, plan in enumerate(plans):
+            if "expected_benefits" not in plan or not plan.get("expected_benefits"):
+                print(f"[WARN] Plan {i+1} ({plan.get('plan_id', 'unknown')}) missing expected_benefits field")
+                plan["expected_benefits"] = []
+            # Ensure it's a list
+            if not isinstance(plan.get("expected_benefits"), list):
+                print(f"[WARN] Plan {i+1} expected_benefits is not a list, converting...")
+                plan["expected_benefits"] = []
+            # Log if empty
+            if not plan.get("expected_benefits"):
+                print(f"[WARN] Plan {i+1} ({plan.get('strategy_name', 'unknown')}) has empty expected_benefits")
+            else:
+                print(f"[INFO] Plan {i+1} has {len(plan.get('expected_benefits', []))} expected benefits")
+        return plans
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"[ERROR] Failed to generate multiple plans: {e}")
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Failed to generate improvement plans: {str(e)}")
 
 
@@ -4787,10 +5684,39 @@ OUTPUT FORMAT (JSON):
         if response_text.endswith("```"):
             response_text = response_text[:-3].strip()
         
-        comparison_result = json.loads(response_text)
+        # Robust JSON parsing with fallback
+        try:
+            comparison_result = json.loads(response_text)
+        except json.JSONDecodeError as e:
+            print(f"[WARN] Direct JSON parse failed for comparison: {e}")
+            # Try to extract and fix JSON fragment
+            start = response_text.find("{")
+            end = response_text.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                json_fragment = response_text[start : end + 1]
+                json_fragment = fix_incomplete_json(json_fragment)
+                try:
+                    comparison_result = json.loads(json_fragment)
+                    print(f"[INFO] Successfully parsed comparison JSON after fixing")
+                except json.JSONDecodeError as e2:
+                    print(f"[ERROR] Failed to parse comparison JSON even after fixing: {e2}")
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"Failed to parse comparison result as JSON. The response may contain unterminated strings or malformed JSON. Error: {str(e2)}"
+                    )
+            else:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Failed to parse comparison result as JSON. No valid JSON structure found. Error: {str(e)}"
+                )
+        
         return comparison_result
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"[ERROR] Failed to compare plans: {e}")
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Failed to compare plans: {str(e)}")
 
 
@@ -4861,10 +5787,55 @@ OUTPUT FORMAT (JSON):
         if response_text.endswith("```"):
             response_text = response_text[:-3].strip()
         
-        synthesis_result = json.loads(response_text)
+        # Robust JSON parsing with fallback
+        try:
+            synthesis_result = json.loads(response_text)
+        except json.JSONDecodeError as e:
+            print(f"[WARN] Direct JSON parse failed for synthesis: {e}")
+            # Try to extract and fix JSON fragment
+            start = response_text.find("{")
+            end = response_text.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                json_fragment = response_text[start : end + 1]
+                json_fragment = fix_incomplete_json(json_fragment)
+                try:
+                    synthesis_result = json.loads(json_fragment)
+                    print(f"[INFO] Successfully parsed synthesis JSON after fixing")
+                except json.JSONDecodeError as e2:
+                    print(f"[ERROR] Failed to parse synthesis JSON even after fixing: {e2}")
+                    # For synthesis, the improved_prompt might be in a separate section
+                    # Try to extract it even if the JSON is malformed
+                    improved_prompt_match = re.search(r'"improved_prompt"\s*:\s*"([^"]*)"', response_text, re.DOTALL)
+                    if improved_prompt_match:
+                        improved_prompt = improved_prompt_match.group(1)
+                        # Create a minimal valid result
+                        synthesis_result = {
+                            "best_combined_plan": {
+                                "improved_prompt": improved_prompt,
+                                "strategy_name": "Extracted from malformed JSON",
+                                "strategy_description": "Prompt was extracted despite JSON parsing errors",
+                                "improvement_summary": "JSON parsing failed, but improved prompt was extracted",
+                            }
+                        }
+                        print(f"[INFO] Extracted improved_prompt from malformed JSON")
+                    else:
+                        raise HTTPException(
+                            status_code=500,
+                            detail=f"Failed to parse synthesis result as JSON. The response may contain unterminated strings or malformed JSON. Error: {str(e2)}"
+                        )
+            else:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Failed to parse synthesis result as JSON. No valid JSON structure found. Error: {str(e)}"
+                )
+        
         return synthesis_result.get("best_combined_plan", {})
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"[ERROR] Failed to synthesize best plan: {e}")
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Failed to synthesize best plan: {str(e)}")
 
 

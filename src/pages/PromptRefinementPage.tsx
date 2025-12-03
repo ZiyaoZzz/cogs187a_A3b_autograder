@@ -1,6 +1,15 @@
 import React, { useState, useEffect } from "react";
-
-const API_BASE = "http://localhost:8000";
+import {
+  API_BASE,
+  getCurrentPrompt as fetchCurrentPrompt,
+  startPromptRefinement as startPromptRefinementApi,
+  critiquePrompt,
+  refinePrompt,
+  generateFinalPrompt,
+  savePrompt as savePromptApi,
+  runRuthlessAuditRequest,
+  runEnhancedPromptRefinement,
+} from "../lib/api";
 
 interface PromptVersion {
   id: string;
@@ -63,11 +72,8 @@ export default function PromptRefinementPage() {
 
   const loadCurrentPrompt = async () => {
     try {
-      const res = await fetch(`${API_BASE}/api/get-current-prompt`);
-      if (res.ok) {
-        const data = await res.json();
-        setOriginalPrompt(data.prompt || "");
-      }
+      const data = await fetchCurrentPrompt();
+      setOriginalPrompt(data.prompt || "");
     } catch (err) {
       console.error("Failed to load current prompt:", err);
     }
@@ -85,20 +91,7 @@ export default function PromptRefinementPage() {
     setRefinementReport("");
 
     try {
-      const res = await fetch(`${API_BASE}/api/start-prompt-refinement`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          originalPrompt,
-          iterations,
-        }),
-      });
-
-      if (!res.ok) {
-        throw new Error("Failed to start refinement process");
-      }
-
-      const data = await res.json();
+      const data = await startPromptRefinementApi({ originalPrompt, iterations });
       setSession(data.session);
       
       // Start the critique loop (loading will be set to false in runCritiqueLoop's finally)
@@ -113,85 +106,43 @@ export default function PromptRefinementPage() {
     try {
       // Round 1: Critic B critiques P0, generates P1
       setSession(prev => prev ? { ...prev, status: "critiquing" } : null);
-      const critiqueRes1 = await fetch(`${API_BASE}/api/critique-prompt`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          sessionId,
-          round: 1,
-          step: "critic_b_round1",
-        }),
+      const critiqueData1 = await critiquePrompt({
+        sessionId,
+        round: 1,
+        step: "critic_b_round1",
       });
-
-      if (!critiqueRes1.ok) {
-        const errorData = await critiqueRes1.json().catch(() => ({}));
-        throw new Error(errorData.detail || "Round 1: Critic B critique failed");
-      }
-      const critiqueData1 = await critiqueRes1.json();
       setSession(critiqueData1.session);
       await new Promise(resolve => setTimeout(resolve, 500));
 
       // Round 2: Designer A compares P0 and P1, synthesizes P2
       setSession(prev => prev ? { ...prev, status: "refining" } : null);
-      const refineRes = await fetch(`${API_BASE}/api/refine-prompt`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          sessionId,
-          round: 2,
-          step: "designer_a_round2",
-        }),
+      const refineData = await refinePrompt({
+        sessionId,
+        round: 2,
+        step: "designer_a_round2",
       });
-
-      if (!refineRes.ok) {
-        const errorData = await refineRes.json().catch(() => ({}));
-        throw new Error(errorData.detail || "Round 2: Designer A synthesis failed");
-      }
-      const refineData = await refineRes.json();
       setSession(refineData.session);
       await new Promise(resolve => setTimeout(resolve, 500));
 
       // Round 3: Critic B reviews P2, generates P3 if extended mode
       if (iterations >= 2) {
         setSession(prev => prev ? { ...prev, status: "critiquing" } : null);
-        const critiqueRes3 = await fetch(`${API_BASE}/api/critique-prompt`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            sessionId,
-            round: 3,
-            step: "critic_b_round3",
-          }),
+        const critiqueData3 = await critiquePrompt({
+          sessionId,
+          round: 3,
+          step: "critic_b_round3",
         });
-
-        if (!critiqueRes3.ok) {
-          const errorData = await critiqueRes3.json().catch(() => ({}));
-          throw new Error(errorData.detail || "Round 3: Critic B review failed");
-        }
-        
-        const critiqueData3 = await critiqueRes3.json();
         setSession(critiqueData3.session);
         await new Promise(resolve => setTimeout(resolve, 500));
 
         // Round 4: Designer A synthesizes P2 and P3 (if extended mode)
         if (iterations >= 3) {
           setSession(prev => prev ? { ...prev, status: "refining" } : null);
-          const refineRes4 = await fetch(`${API_BASE}/api/refine-prompt`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              sessionId,
-              round: 4,
-              step: "designer_a_round4",
-            }),
+          const refineData4 = await refinePrompt({
+            sessionId,
+            round: 4,
+            step: "designer_a_round4",
           });
-
-          if (!refineRes4.ok) {
-            const errorData = await refineRes4.json().catch(() => ({}));
-            throw new Error(errorData.detail || "Round 4: Designer A synthesis failed");
-          }
-          
-          const refineData4 = await refineRes4.json();
           setSession(refineData4.session);
           await new Promise(resolve => setTimeout(resolve, 500));
         }
@@ -199,17 +150,7 @@ export default function PromptRefinementPage() {
 
       // Final: Judge selects Best Prompt from all candidates
       setSession(prev => prev ? { ...prev, status: "refining" } : null);
-      const finalRes = await fetch(`${API_BASE}/api/generate-final-prompt`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ sessionId }),
-      });
-
-      if (!finalRes.ok) {
-        const errorData = await finalRes.json().catch(() => ({}));
-        throw new Error(errorData.detail || "Final: Judge selection failed");
-      }
-      const finalData = await finalRes.json();
+      const finalData = await generateFinalPrompt({ sessionId });
       setFinalPrompt(finalData.finalPrompt);
       setRefinementReport(finalData.refinementReport || "");
       setSession(prev => {
@@ -265,18 +206,8 @@ export default function PromptRefinementPage() {
 
     setSavingPrompt(true);
     try {
-      const res = await fetch(`${API_BASE}/api/save-prompt`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt: finalPrompt }),
-      });
-
-      if (res.ok) {
-        alert("Prompt saved to backend successfully! It will be used as the default prompt for future analyses.");
-      } else {
-        const errorData = await res.json().catch(() => ({}));
-        throw new Error(errorData.detail || "Failed to save prompt");
-      }
+      await savePromptApi(finalPrompt);
+      alert("Prompt saved to backend successfully! It will be used as the default prompt for future analyses.");
     } catch (err: any) {
       alert(`Failed to save prompt: ${err.message}`);
     } finally {
@@ -295,21 +226,10 @@ export default function PromptRefinementPage() {
     setAuditResult(null);
 
     try {
-      const res = await fetch(`${API_BASE}/api/ruthless-audit`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          prompt: originalPrompt,
-          systemContext: "Autograder for UX/HCI heuristic evaluation assignments. System uses LLM (Gemini) to grade student submissions page-by-page, then aggregates into issues and final scores.",
-        }),
+      const data = await runRuthlessAuditRequest({
+        prompt: originalPrompt,
+        systemContext: "Autograder for UX/HCI heuristic evaluation assignments. System uses LLM (Gemini) to grade student submissions page-by-page, then aggregates into issues and final scores.",
       });
-
-      if (!res.ok) {
-        const errorData = await res.json().catch(() => ({}));
-        throw new Error(errorData.detail || "Failed to run ruthless audit");
-      }
-
-      const data = await res.json();
       setAuditResult(data.audit);
     } catch (err: any) {
       setError(err.message || "Ruthless audit failed");
@@ -331,21 +251,22 @@ export default function PromptRefinementPage() {
     setEnhancedRefinementResult(null);
 
     try {
-      const res = await fetch(`${API_BASE}/api/enhanced-prompt-refinement`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          originalPrompt,
-          numPlans: 3,
-        }),
+      const data = await runEnhancedPromptRefinement({
+        originalPrompt,
+        numPlans: 3,
       });
-
-      if (!res.ok) {
-        const errorData = await res.json().catch(() => ({}));
-        throw new Error(errorData.detail || "Failed to run enhanced refinement");
+      // Debug: log the received data
+      console.log("Enhanced refinement result:", data);
+      if (data.plans) {
+        console.log("Plans received:", data.plans.length);
+        data.plans.forEach((plan: any, idx: number) => {
+          console.log(`Plan ${idx + 1}:`, {
+            strategy_name: plan.strategy_name,
+            expected_benefits: plan.expected_benefits,
+            has_expected_benefits: !!plan.expected_benefits && plan.expected_benefits.length > 0
+          });
+        });
       }
-
-      const data = await res.json();
       setEnhancedRefinementResult(data);
       setFinalPrompt(data.improved_prompt || "");
       setRefinementReport(JSON.stringify({
@@ -599,7 +520,11 @@ export default function PromptRefinementPage() {
                     <div className="font-semibold mb-1">{plan.strategy_name}</div>
                     <div className="text-xs text-slate-600 mb-2">{plan.strategy_description}</div>
                     <div className="text-xs">
-                      <strong>Expected Benefits:</strong> {plan.expected_benefits?.join(", ")}
+                      <strong>Expected Benefits:</strong>{" "}
+                      {plan.expected_benefits && plan.expected_benefits.length > 0 
+                        ? plan.expected_benefits.join(", ")
+                        : <span className="text-slate-400 italic">No expected benefits specified</span>
+                      }
                     </div>
                   </div>
                 ))}
@@ -708,7 +633,11 @@ export default function PromptRefinementPage() {
                     <div className="font-semibold mb-1">{plan.strategy_name}</div>
                     <div className="text-xs text-slate-600 mb-2">{plan.strategy_description}</div>
                     <div className="text-xs">
-                      <strong>Expected Benefits:</strong> {plan.expected_benefits?.join(", ")}
+                      <strong>Expected Benefits:</strong>{" "}
+                      {plan.expected_benefits && plan.expected_benefits.length > 0 
+                        ? plan.expected_benefits.join(", ")
+                        : <span className="text-slate-400 italic">No expected benefits specified</span>
+                      }
                     </div>
                   </div>
                 ))}

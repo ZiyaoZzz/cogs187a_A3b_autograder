@@ -11,6 +11,25 @@ echo ""
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+# Ensure .env exists (copy from template on first run)
+if [ ! -f ".env" ]; then
+    if [ -f "env.template" ]; then
+        cp env.template .env
+        echo "🆕 Created .env from env.template."
+        echo "   Please open .env and paste your real GEMINI_API_KEY."
+    else
+        echo "⚠️  No .env found. Create one with GEMINI_API_KEY=your-key."
+    fi
+fi
+
+if [ -f ".env" ]; then
+    GEMINI_VALUE="$(grep -E '^GEMINI_API_KEY=' .env | cut -d'=' -f2-)"
+    if [ -z "$GEMINI_VALUE" ] || [ "$GEMINI_VALUE" = "PASTE_GEMINI_KEY_HERE" ]; then
+        echo "⚠️  GEMINI_API_KEY in .env is empty or still the placeholder."
+        echo "   The app will start, but AI grading endpoints will return an error until you add a key."
+    fi
+fi
+
 # Check and install frontend dependencies
 if [ ! -d "node_modules" ]; then
     echo "📦 Installing frontend dependencies..."

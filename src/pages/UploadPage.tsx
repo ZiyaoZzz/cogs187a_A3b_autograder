@@ -8,8 +8,9 @@ import type {
   PageAnalysis,
   HeuristicFragment,
   PageRole,
-  RubricLevel
+  RubricLevel,
 } from "../lib/types";
+import { API_BASE, loadJobsWithStatus } from "../lib/api";
 
 
 interface HeuristicInfo {
@@ -173,7 +174,50 @@ function StructuredAnalysisDisplay({ analysis }: { analysis: PageAnalysis }) {
         </div>
       )}
 
-      {analysis.fragments.length === 0 && !analysis.severity_summary && (
+      {/* AI Opportunities */}
+      {analysis.ai_opportunities_info && (
+        <div className="border-t border-emerald-200 pt-2">
+          <p className="text-xs font-medium text-emerald-900 mb-1">AI Opportunities:</p>
+          <div className="text-xs bg-white rounded border border-emerald-200 p-2 space-y-2">
+            {analysis.ai_opportunities_info.llm_summary && (
+              <div>
+                <span className="text-emerald-700 font-medium">Summary:</span>
+                <p className="text-emerald-800 mt-1">{analysis.ai_opportunities_info.llm_summary}</p>
+              </div>
+            )}
+            {analysis.ai_opportunities_info.raw_text_excerpt && (
+              <div>
+                <span className="text-emerald-700 font-medium">Content:</span>
+                <p className="text-emerald-600 italic mt-1 whitespace-pre-wrap">{analysis.ai_opportunities_info.raw_text_excerpt}</p>
+              </div>
+            )}
+            <div className="grid grid-cols-2 gap-2 mt-2">
+              <div className="flex justify-between">
+                <span className="text-emerald-700">Relevance to Violations:</span>
+                <span className={`font-medium ${
+                  analysis.ai_opportunities_info.relevance_to_violations === "high" ? "text-green-700" :
+                  analysis.ai_opportunities_info.relevance_to_violations === "med" ? "text-amber-700" :
+                  "text-red-700"
+                }`}>
+                  {analysis.ai_opportunities_info.relevance_to_violations}
+                </span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-emerald-700">Specificity:</span>
+                <span className={`font-medium ${
+                  analysis.ai_opportunities_info.specificity === "very_specific" ? "text-green-700" :
+                  analysis.ai_opportunities_info.specificity === "somewhat_specific" ? "text-amber-700" :
+                  "text-red-700"
+                }`}>
+                  {analysis.ai_opportunities_info.specificity.replace("_", " ")}
+                </span>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {analysis.fragments.length === 0 && !analysis.severity_summary && !analysis.ai_opportunities_info && (
         <p className="text-xs text-emerald-600 italic">
           No specific heuristic violations or issues identified on this page.
         </p>
@@ -187,6 +231,9 @@ export default function UploadPage() {
   const [loading, setLoading] = useState(false);
   const [analyzing, setAnalyzing] = useState(false);
   const [analyzingProgress, setAnalyzingProgress] = useState<{ current: number; total: number } | null>(null);
+  const [postProcessing, setPostProcessing] = useState(false);
+  const [currentAnalyzingJobId, setCurrentAnalyzingJobId] = useState<string | null>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<HeuristicExtractionResult | null>(null);
   const [analysisResults, setAnalysisResults] = useState<PageAnalysisResult[] | null>(null);
@@ -198,7 +245,7 @@ export default function UploadPage() {
     hasAnalysis?: boolean;
     hasOverrides?: boolean;
     hasFinalGrade?: boolean;
-    status?: "ai_graded" | "ta_reviewed" | "final_graded";
+    status?: "ai_graded" | "ta_reviewed" | "final_graded" | undefined;
   }>>([]);
   const [loadingPrevious, setLoadingPrevious] = useState(false);
   const [duplicateFile, setDuplicateFile] = useState<{
@@ -221,8 +268,67 @@ export default function UploadPage() {
   const [batchPaused, setBatchPaused] = useState(false);
   const [batchSize, setBatchSize] = useState(1); // Process 1 at a time by default
   const [showReviewerModeModal, setShowReviewerModeModal] = useState(false);
-  const navigate = useNavigate();
+  const [showNavigationConfirm, setShowNavigationConfirm] = useState(false);
+  const [pendingNavigation, setPendingNavigation] = useState<(() => void) | null>(null);
+  const navigateBase = useNavigate();
   const prevAnalyzingRef = useRef(false);
+
+  // Wrapped navigate function that intercepts navigation when analyzing or post-processing
+  const navigate = React.useCallback((to: string | number, options?: any) => {
+    if ((analyzing || postProcessing) && typeof to === "string" && to.startsWith("/")) {
+      setPendingNavigation(() => () => {
+        navigateBase(to as string, options);
+      });
+      setShowNavigationConfirm(true);
+      return;
+    }
+    if (typeof to === "number") {
+      navigateBase(to);
+    } else {
+      navigateBase(to, options);
+    }
+  }, [analyzing, postProcessing, navigateBase]);
+
+  // Intercept navigation when analyzing or post-processing
+  useEffect(() => {
+    if (!analyzing && !postProcessing) return;
+
+    // Intercept browser navigation (back button, refresh, etc.)
+    const handleBeforeUnload = (e: BeforeUnloadEvent) => {
+      e.preventDefault();
+      const message = analyzing
+        ? "Analysis is in progress. If you leave, the analysis will be terminated and results will not be saved. Are you sure you want to leave?"
+        : "Processing is in progress. If you leave, the processing may be incomplete. Are you sure you want to leave?";
+      e.returnValue = message;
+      return e.returnValue;
+    };
+
+    window.addEventListener("beforeunload", handleBeforeUnload);
+
+    // Intercept React Router navigation by wrapping navigate
+    const handleClick = (e: MouseEvent) => {
+      const target = e.target as HTMLElement;
+      const link = target.closest("a[href]");
+      if (link) {
+        const href = link.getAttribute("href");
+        if (href && href.startsWith("/") && href !== window.location.pathname) {
+          e.preventDefault();
+          e.stopPropagation();
+          setPendingNavigation(() => () => {
+            navigate(href);
+          });
+          setShowNavigationConfirm(true);
+        }
+      }
+    };
+
+    document.addEventListener("click", handleClick, true);
+
+    return () => {
+      window.removeEventListener("beforeunload", handleBeforeUnload);
+      document.removeEventListener("click", handleClick, true);
+    };
+  }, [analyzing, postProcessing, navigate]);
 
   // Load heuristics info from rubric
   useEffect(() => {
@@ -247,83 +353,8 @@ export default function UploadPage() {
     async function loadPreviousSubmissions() {
       setLoadingPrevious(true);
       try {
-        const res = await fetch("http://localhost:8000/api/list-jobs");
-        if (res.ok) {
-          const data = await res.json();
-          const jobs = data.jobs || [];
-          
-          // Check which jobs have analysis results, overrides, and final grades
-          const jobsWithAnalysis = await Promise.all(
-            jobs.map(async (job: any) => {
-              try {
-                const analysisRes = await fetch(`http://localhost:8000/api/get-analysis-results?jobId=${job.jobId}`);
-                const hasAnalysis = analysisRes.ok && (await analysisRes.json()).results?.length > 0;
-                
-                // Check for overrides (TA review)
-                let hasOverrides = false;
-                try {
-                  const overridesRes = await fetch(`http://localhost:8000/api/get-overrides?jobId=${job.jobId}`);
-                  if (overridesRes.ok) {
-                    const overridesData = await overridesRes.json();
-                    hasOverrides = overridesData.overrides && overridesData.overrides.length > 0;
-                  }
-                } catch {
-                  // Ignore errors
-                }
-                
-                // Check for final grade (final graded)
-                let hasFinalGrade = false;
-                try {
-                  const finalGradeRes = await fetch(`http://localhost:8000/api/get-final-grade?jobId=${job.jobId}`);
-                  if (finalGradeRes.ok) {
-                    const finalGradeData = await finalGradeRes.json();
-                    hasFinalGrade = finalGradeData.finalGrade !== undefined && finalGradeData.finalGrade !== null;
-                  }
-                } catch {
-                  // Ignore errors
-                }
-                
-                // Determine status
-                let status: "ai_graded" | "ta_reviewed" | "final_graded" = "ai_graded";
-                if (hasFinalGrade) {
-                  status = "final_graded";
-                } else if (hasOverrides) {
-                  status = "ta_reviewed";
-                } else if (hasAnalysis) {
-                  status = "ai_graded";
-                }
-                
-                return {
-                  ...job,
-                  hasAnalysis,
-                  hasOverrides,
-                  hasFinalGrade,
-                  status,
-                };
-              } catch {
-                return { 
-                  ...job, 
-                  hasAnalysis: false,
-                  hasOverrides: false,
-                  hasFinalGrade: false,
-                  status: "ai_graded" as const,
-                };
-              }
-            })
-          );
-          
-          // Sort: ungraded (no analysis) first, then by date (newest first)
-          jobsWithAnalysis.sort((a, b) => {
-            if (a.hasAnalysis !== b.hasAnalysis) {
-              return a.hasAnalysis ? 1 : -1; // ungraded first
-            }
-            const dateA = a.createdAt ? new Date(a.createdAt).getTime() : 0;
-            const dateB = b.createdAt ? new Date(b.createdAt).getTime() : 0;
-            return dateB - dateA; // newest first
-          });
-          
-          setPreviousSubmissions(jobsWithAnalysis);
-        }
+        const jobs = await loadJobsWithStatus();
+        setPreviousSubmissions(jobs);
       } catch (err) {
         console.error("Failed to load previous submissions:", err);
       } finally {
@@ -362,13 +393,13 @@ export default function UploadPage() {
     setError(null);
     try {
       // Load extraction result
-      const pagesRes = await fetch(`http://localhost:8000/api/get-extraction-result?jobId=${jobId}`);
+      const pagesRes = await fetch(`${API_BASE}/api/get-extraction-result?jobId=${jobId}`);
       if (!pagesRes.ok) throw new Error("Failed to load submission");
 
       const pagesData = await pagesRes.json();
       
       // Load analysis results if they exist
-      const analysisRes = await fetch(`http://localhost:8000/api/get-analysis-results?jobId=${jobId}`);
+      const analysisRes = await fetch(`${API_BASE}/api/get-analysis-results?jobId=${jobId}`);
       let analysisResults: PageAnalysisResult[] = [];
       
       if (analysisRes.ok) {
@@ -407,7 +438,32 @@ export default function UploadPage() {
   // Delete a submission
   const deleteSubmission = async (jobId: string) => {
     try {
-      const res = await fetch(`http://localhost:8000/api/delete-submission?jobId=${jobId}`, {
+      // If this submission is currently being analyzed, cancel the analysis first
+      if (currentAnalyzingJobId === jobId && analyzing && abortControllerRef.current) {
+        console.log("Cancelling analysis for deleted submission:", jobId);
+        abortControllerRef.current.abort();
+        setAnalyzing(false);
+        setAnalyzingProgress(null);
+        setPostProcessing(false);
+        abortControllerRef.current = null;
+        setCurrentAnalyzingJobId(null);
+      }
+
+      // Also check if it's the current result being analyzed
+      if (result?.jobId === jobId && analyzing && abortControllerRef.current) {
+        console.log("Cancelling analysis for current result:", jobId);
+        abortControllerRef.current.abort();
+        setAnalyzing(false);
+        setAnalyzingProgress(null);
+        setPostProcessing(false);
+        abortControllerRef.current = null;
+        setCurrentAnalyzingJobId(null);
+        // Clear the result since it's being deleted
+        setResult(null);
+        setAnalysisResults(null);
+      }
+
+      const res = await fetch(`${API_BASE}/api/delete-submission?jobId=${jobId}`, {
         method: "DELETE",
       });
 
@@ -476,7 +532,7 @@ export default function UploadPage() {
       const formData = new FormData();
       formData.append("file", file);
       
-      const extractRes = await fetch("http://localhost:8000/api/extract-heuristic-pages", {
+      const extractRes = await fetch(`${API_BASE}/api/extract-heuristic-pages`, {
         method: "POST",
         body: formData,
       });
@@ -506,12 +562,30 @@ export default function UploadPage() {
         };
 
         try {
-          const analysisRes = await fetch("http://localhost:8000/api/analyze-single-page", {
+          // Get previous pages' analysis results for heuristic hint
+          // Include both analysis results AND original page content for better heuristic extraction
+          const previousPagesForHint = analysisResults
+            .filter((r: any) => r.page_number < normalizedPage.pageNumber && r.structured_analysis)
+            .map((r: any) => {
+              // Find the original page data to get snippet
+              const originalPage = pages.find((p: any) => p.page_number === r.page_number);
+              return {
+                page_number: r.page_number,
+                page_role: r.structured_analysis?.page_role,
+                main_heading: r.structured_analysis?.main_heading,
+                fragments: r.structured_analysis?.fragments || [],
+                page_content: originalPage?.snippet || "", // Include original content for heuristic extraction
+              };
+            })
+            .filter((p: any) => p.page_role === "heuristic_explainer");
+          
+          const analysisRes = await fetch(`${API_BASE}/api/analyze-single-page`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
               page: normalizedPage,
               jobId,
+              previousPages: previousPagesForHint,
             }),
           });
 
@@ -619,31 +693,8 @@ export default function UploadPage() {
   // Helper function to refresh previous submissions list
   const refreshPreviousSubmissions = async () => {
     try {
-      const jobsRes = await fetch("http://localhost:8000/api/list-jobs");
-      if (jobsRes.ok) {
-        const jobsData = await jobsRes.json();
-        const jobs = jobsData.jobs || [];
-        const jobsWithAnalysis = await Promise.all(
-          jobs.map(async (job: any) => {
-            try {
-              const analysisRes = await fetch(`http://localhost:8000/api/get-analysis-results?jobId=${job.jobId}`);
-              const hasAnalysis = analysisRes.ok && (await analysisRes.json()).results?.length > 0;
-              return { ...job, hasAnalysis };
-            } catch {
-              return { ...job, hasAnalysis: false };
-            }
-          })
-        );
-        jobsWithAnalysis.sort((a, b) => {
-          if (a.hasAnalysis !== b.hasAnalysis) {
-            return a.hasAnalysis ? 1 : -1;
-          }
-          const dateA = a.createdAt ? new Date(a.createdAt).getTime() : 0;
-          const dateB = b.createdAt ? new Date(b.createdAt).getTime() : 0;
-          return dateB - dateA;
-        });
-        setPreviousSubmissions(jobsWithAnalysis);
-      }
+      const jobs = await loadJobsWithStatus();
+      setPreviousSubmissions(jobs);
     } catch (err) {
       console.error("Failed to refresh submissions list:", err);
     }
@@ -655,15 +706,9 @@ export default function UploadPage() {
 
     if (choice === "load") {
       await loadPreviousSubmission(duplicateFile.jobId);
-      // After loading an existing submission, immediately navigate to Reviewer Mode for that job
+      // Load data to current page, showing "Analyze with Gemini" section
+      // Don't navigate away - let user see the extraction results and choose to analyze
       setDuplicateFile(null);
-      if (duplicateFile.jobId) {
-        localStorage.setItem(
-          "recentJobIds",
-          JSON.stringify([{ jobId: duplicateFile.jobId, fileName: duplicateFile.fileName }]),
-        );
-        navigate(`/issue-reviewer?jobId=${duplicateFile.jobId}`);
-      }
     } else if (choice === "delete") {
       if (window.confirm(`Are you sure you want to delete "${duplicateFile.fileName}"? This action cannot be undone.`)) {
         await deleteSubmission(duplicateFile.jobId);
@@ -724,7 +769,7 @@ export default function UploadPage() {
       let errorMessage = err.message || "Something went wrong while parsing the PDF.";
       
       if (err.message?.includes("Failed to fetch") || err.message?.includes("NetworkError") || err.name === "TypeError") {
-        errorMessage = "Cannot connect to backend server. Please ensure the backend is running:\n\n1. Run: npm start\n2. Or manually: cd backend && python -m uvicorn main:app --reload\n3. Backend should be available at http://localhost:8000";
+        errorMessage = `Cannot connect to backend server. Please ensure the backend is running:\n\n1. Run: npm start\n2. Or manually: cd backend && python -m uvicorn main:app --reload\n3. Backend should be available at ${API_BASE}`;
       }
       
       setError(errorMessage);
@@ -738,6 +783,8 @@ export default function UploadPage() {
     setAnalysisResults([]);
     setError(null);
     await handleAnalyze();
+    // After rerun completes, automatically navigate to reviewer mode to show new results
+    // The navigation will happen in handleAnalyze's finally block if analysis is complete
   };
 
   // Get missing pages that need analysis
@@ -768,6 +815,11 @@ export default function UploadPage() {
       return;
     }
 
+    // Create new AbortController for this analyze session
+    const abortController = new AbortController();
+    abortControllerRef.current = abortController;
+    setCurrentAnalyzingJobId(result.jobId);
+
     setAnalyzing(true);
     setError(null);
     setAnalyzingProgress({ current: 0, total: missingPages.length });
@@ -780,12 +832,39 @@ export default function UploadPage() {
       const concurrency = 2;
       
       for (let i = 0; i < missingPages.length; i += concurrency) {
+        // Check if analysis was cancelled
+        if (abortController.signal.aborted) {
+          console.log("Analysis cancelled");
+          break;
+        }
+
         const batch = missingPages.slice(i, i + concurrency);
         
         // Process batch concurrently
         const batchPromises = batch.map(async (page) => {
           try {
-            const res = await fetch("http://localhost:8000/api/analyze-single-page", {
+            // Get previous pages' analysis results for heuristic hint
+            // Find the most recent heuristic_explainer page before this page
+            // Include both analysis results AND original page content for better heuristic extraction
+            const previousPagesForHint = [
+              ...existingResults,
+              ...newResults,
+            ]
+              .filter((r: any) => r.page_number < page.pageNumber && r.structured_analysis)
+              .map((r: any) => {
+                // Find the original page data to get snippet
+                const originalPage = result.pages.find((p: any) => p.pageNumber === r.page_number);
+                return {
+                  page_number: r.page_number,
+                  page_role: r.structured_analysis?.page_role,
+                  main_heading: r.structured_analysis?.main_heading,
+                  fragments: r.structured_analysis?.fragments || [],
+                  page_content: originalPage?.snippet || "", // Include original content for heuristic extraction
+                };
+              })
+              .filter((p: any) => p.page_role === "heuristic_explainer");
+            
+            const res = await fetch(`${API_BASE}/api/analyze-single-page`, {
               method: "POST",
               headers: {
                 "Content-Type": "application/json",
@@ -793,7 +872,9 @@ export default function UploadPage() {
               body: JSON.stringify({
                 page: page,
                 jobId: result.jobId,
+                previousPages: previousPagesForHint,
               }),
+              signal: abortController.signal, // Add abort signal
             });
 
             if (!res.ok) {
@@ -830,6 +911,11 @@ export default function UploadPage() {
             }
             throw new Error("Unknown response status");
           } catch (err: any) {
+            // Check if analysis was cancelled
+            if (err.name === "AbortError" || abortController.signal.aborted) {
+              throw err; // Re-throw to break out of the batch
+            }
+
             let errorMsg = err.message || "Failed to analyze this page";
             if (err.message?.includes("Failed to fetch") || err.message?.includes("NetworkError") || err.name === "TypeError") {
               errorMsg = "Cannot connect to backend server. Please ensure the backend is running.";
@@ -864,10 +950,33 @@ export default function UploadPage() {
       // Merge with existing results
       setAnalysisResults([...existingResults, ...newResults]);
     } catch (err: any) {
-      setError(`Failed to analyze missing pages: ${err.message || "Unknown error"}`);
+      // Check if analysis was cancelled
+      if (err.name === "AbortError" || abortController.signal.aborted) {
+        console.log("Analysis cancelled");
+      } else {
+        setError(`Failed to analyze missing pages: ${err.message || "Unknown error"}`);
+      }
     } finally {
-      setAnalyzing(false);
-      setAnalyzingProgress({ current: 0, total: 0 });
+      // Only show post-processing if analysis wasn't cancelled
+      if (!abortController.signal.aborted) {
+        setAnalyzing(false);
+        setAnalyzingProgress({ current: 0, total: 0 });
+        
+        // Show post-processing state for 10 seconds
+        setPostProcessing(true);
+        setTimeout(() => {
+          setPostProcessing(false);
+        }, 10000);
+      } else {
+        // Analysis was cancelled, just reset states
+        setAnalyzing(false);
+        setAnalyzingProgress({ current: 0, total: 0 });
+        setPostProcessing(false);
+      }
+      
+      // Clear refs
+      abortControllerRef.current = null;
+      setCurrentAnalyzingJobId(null);
     }
   };
 
@@ -877,6 +986,11 @@ export default function UploadPage() {
       return;
     }
 
+    // Create new AbortController for this analyze session
+    const abortController = new AbortController();
+    abortControllerRef.current = abortController;
+    setCurrentAnalyzingJobId(result.jobId);
+
     setAnalyzing(true);
     setError(null);
     setAnalysisResults([]);
@@ -885,109 +999,165 @@ export default function UploadPage() {
     const results: PageAnalysisResult[] = [];
 
     try {
-      // Analyze pages with limited concurrency (2 at a time) to balance speed and API limits
-      const concurrency = 2;
+      // Process pages sequentially to ensure previous pages' analysis is available for heuristic hints
       const pages = result.pages;
       
-      for (let i = 0; i < pages.length; i += concurrency) {
-        const batch = pages.slice(i, i + concurrency);
+      for (let i = 0; i < pages.length; i++) {
+        // Check if analysis was cancelled
+        if (abortController.signal.aborted) {
+          console.log("Analysis cancelled");
+          break;
+        }
+
+        const page = pages[i];
         
-        // Process batch concurrently
-        const batchPromises = batch.map(async (page) => {
-          try {
-            const res = await fetch("http://localhost:8000/api/analyze-single-page", {
-              method: "POST",
-              headers: {
-                "Content-Type": "application/json",
-              },
-              body: JSON.stringify({
-                page: page,
-                jobId: result.jobId,
-              }),
-            });
+        try {
+          // Get previous pages' analysis results for heuristic hint
+          // Find the most recent heuristic_explainer page before this page
+          // Include both analysis results AND original page content for better heuristic extraction
+          const previousPagesForHint = results
+            .filter((r: any) => r.page_number < page.pageNumber && r.structured_analysis)
+            .map((r: any) => {
+              // Find the original page data to get snippet
+              const originalPage = result.pages.find((p: any) => p.pageNumber === r.page_number);
+              return {
+                page_number: r.page_number,
+                page_role: r.structured_analysis?.page_role,
+                main_heading: r.structured_analysis?.main_heading,
+                fragments: r.structured_analysis?.fragments || [],
+                page_content: originalPage?.snippet || "", // Include original content for heuristic extraction
+              };
+            })
+            .filter((p: any) => p.page_role === "heuristic_explainer");
+          
+          const res = await fetch("http://localhost:8000/api/analyze-single-page", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              page: page,
+              jobId: result.jobId,
+              previousPages: previousPagesForHint,
+            }),
+            signal: abortController.signal, // Add abort signal
+          });
 
-            if (!res.ok) {
-              const data = await res.json().catch(() => null);
-              const msg = data?.detail || `Request failed with status ${res.status}`;
-              // Check for token/quota errors
-              const errorStr = msg.toLowerCase();
-              if (errorStr.includes("quota") || errorStr.includes("rate limit") || errorStr.includes("resource_exhausted") || 
-                  errorStr.includes("429") || errorStr.includes("token") || errorStr.includes("billing") ||
-                  errorStr.includes("api key") || errorStr.includes("authentication")) {
-                setError(`⚠️ API Error (Page ${page.pageNumber}): ${msg}`);
-              }
-              throw new Error(msg);
-            }
-
-            const data = await res.json();
-            if (data.status === "completed" && data.result) {
-              // Check if result contains error related to tokens/quota
-              if (data.result.error) {
-                const errorStr = data.result.error.toLowerCase();
-                if (errorStr.includes("quota") || errorStr.includes("rate limit") || errorStr.includes("resource_exhausted") || 
-                    errorStr.includes("429") || errorStr.includes("token") || errorStr.includes("billing") ||
-                    errorStr.includes("api key") || errorStr.includes("authentication")) {
-                  setError(`⚠️ API Error (Page ${page.pageNumber}): ${data.result.error}`);
-                }
-              }
-              return data.result;
-            } else if (data.status === "error") {
-              // Check for token/quota errors in error response
-              const errorStr = (data.result?.error || data.detail || "").toLowerCase();
-              if (errorStr.includes("quota") || errorStr.includes("rate limit") || errorStr.includes("resource_exhausted") || 
-                  errorStr.includes("429") || errorStr.includes("token") || errorStr.includes("billing") ||
-                  errorStr.includes("api key") || errorStr.includes("authentication")) {
-                setError(`⚠️ API Error (Page ${page.pageNumber}): ${data.result?.error || data.detail || "Token/quota issue"}`);
-              }
-              return data.result;
-            }
-            throw new Error("Unknown response status");
-          } catch (err: any) {
-            // Check if it's a connection error
-            let errorMsg = err.message || "Failed to analyze this page";
-            if (err.message?.includes("Failed to fetch") || err.message?.includes("NetworkError") || err.name === "TypeError") {
-              errorMsg = "Cannot connect to backend server. Please ensure the backend is running.";
-            }
-            
+          if (!res.ok) {
+            const data = await res.json().catch(() => null);
+            const msg = data?.detail || `Request failed with status ${res.status}`;
             // Check for token/quota errors
-            const errorStr = err.message?.toLowerCase() || "";
+            const errorStr = msg.toLowerCase();
             if (errorStr.includes("quota") || errorStr.includes("rate limit") || errorStr.includes("resource_exhausted") || 
                 errorStr.includes("429") || errorStr.includes("token") || errorStr.includes("billing") ||
                 errorStr.includes("api key") || errorStr.includes("authentication")) {
-              errorMsg = `API Error: ${err.message || "Token quota exhausted or API key issue. Please check your API key and billing status."}`;
-              // Set global error to display prominently
-              setError(`⚠️ API Error (Page ${page.pageNumber}): ${errorMsg}`);
+              setError(`⚠️ API Error (Page ${page.pageNumber}): ${msg}`);
             }
-            
-            // Return error result
-            return {
-              page_number: page.pageNumber,
-              error: errorMsg,
-              feedback: `Error analyzing page ${page.pageNumber}: ${errorMsg}`,
-            };
+            throw new Error(msg);
           }
-        });
 
-        // Wait for batch to complete
-        const batchResults = await Promise.all(batchPromises);
-        results.push(...batchResults);
-        
-        // Update progress and results
-        setAnalyzingProgress({ current: Math.min(i + concurrency, pages.length), total: pages.length });
-        setAnalysisResults([...results]);
+          const data = await res.json();
+          let pageResult;
+          if (data.status === "completed" && data.result) {
+            // Check if result contains error related to tokens/quota
+            if (data.result.error) {
+              const errorStr = data.result.error.toLowerCase();
+              if (errorStr.includes("quota") || errorStr.includes("rate limit") || errorStr.includes("resource_exhausted") || 
+                  errorStr.includes("429") || errorStr.includes("token") || errorStr.includes("billing") ||
+                  errorStr.includes("api key") || errorStr.includes("authentication")) {
+                setError(`⚠️ API Error (Page ${page.pageNumber}): ${data.result.error}`);
+              }
+            }
+            pageResult = data.result;
+          } else if (data.status === "error") {
+            // Check for token/quota errors in error response
+            const errorStr = (data.result?.error || data.detail || "").toLowerCase();
+            if (errorStr.includes("quota") || errorStr.includes("rate limit") || errorStr.includes("resource_exhausted") || 
+                errorStr.includes("429") || errorStr.includes("token") || errorStr.includes("billing") ||
+                errorStr.includes("api key") || errorStr.includes("authentication")) {
+              setError(`⚠️ API Error (Page ${page.pageNumber}): ${data.result?.error || data.detail || "Token/quota issue"}`);
+            }
+            pageResult = data.result;
+          } else {
+            throw new Error("Unknown response status");
+          }
+          
+          results.push(pageResult);
+          
+          // Update progress and results after each page
+          setAnalyzingProgress({ current: i + 1, total: pages.length });
+          setAnalysisResults([...results]);
+        } catch (err: any) {
+          // Check if analysis was cancelled
+          if (err.name === "AbortError" || abortController.signal.aborted) {
+            console.log("Analysis cancelled during page processing");
+            break; // Exit the loop if cancelled
+          }
+
+          // Check if it's a connection error
+          let errorMsg = err.message || "Failed to analyze this page";
+          if (err.message?.includes("Failed to fetch") || err.message?.includes("NetworkError") || err.name === "TypeError") {
+            errorMsg = "Cannot connect to backend server. Please ensure the backend is running.";
+          }
+          
+          // Check for token/quota errors
+          const errorStr = err.message?.toLowerCase() || "";
+          if (errorStr.includes("quota") || errorStr.includes("rate limit") || errorStr.includes("resource_exhausted") || 
+              errorStr.includes("429") || errorStr.includes("token") || errorStr.includes("billing") ||
+              errorStr.includes("api key") || errorStr.includes("authentication")) {
+            errorMsg = `API Error: ${err.message || "Token quota exhausted or API key issue. Please check your API key and billing status."}`;
+            // Set global error to display prominently
+            setError(`⚠️ API Error (Page ${page.pageNumber}): ${errorMsg}`);
+          }
+          
+          // Add error result
+          const errorResult = {
+            page_number: page.pageNumber,
+            error: errorMsg,
+            feedback: `Error analyzing page ${page.pageNumber}: ${errorMsg}`,
+          };
+          results.push(errorResult);
+          
+          // Update progress and results
+          setAnalyzingProgress({ current: i + 1, total: pages.length });
+          setAnalysisResults([...results]);
+        }
       }
     } catch (err: any) {
       let errorMessage = err.message || "Something went wrong while analyzing with Gemini.";
       
       // Check if it's a connection error
       if (err.message?.includes("Failed to fetch") || err.message?.includes("NetworkError") || err.name === "TypeError") {
-        errorMessage = "Cannot connect to backend server. Please ensure the backend is running:\n\n1. Run: npm start\n2. Or manually: cd backend && python -m uvicorn main:app --reload\n3. Backend should be available at http://localhost:8000";
+        errorMessage = `Cannot connect to backend server. Please ensure the backend is running:\n\n1. Run: npm start\n2. Or manually: cd backend && python -m uvicorn main:app --reload\n3. Backend should be available at ${API_BASE}`;
       }
       
       setError(errorMessage);
     } finally {
-      setAnalyzing(false);
-      setAnalyzingProgress(null);
+      // Only show post-processing if analysis wasn't cancelled
+      if (!abortController.signal.aborted) {
+        // After analysis completes, show post-processing state for 10 seconds
+        // This allows backend to finish processing pages and issues
+        // Use a small delay to ensure analyzing state is cleared before showing post-processing
+        setTimeout(() => {
+          setAnalyzing(false);
+          setAnalyzingProgress(null);
+          
+          // Show post-processing state for 10 seconds
+          setPostProcessing(true);
+          setTimeout(() => {
+            setPostProcessing(false);
+          }, 10000);
+        }, 100); // Small delay to ensure state updates are processed
+      } else {
+        // Analysis was cancelled, just reset states
+        setAnalyzing(false);
+        setAnalyzingProgress(null);
+        setPostProcessing(false);
+      }
+      
+      // Clear refs
+      abortControllerRef.current = null;
+      setCurrentAnalyzingJobId(null);
     }
   };
 
@@ -1350,6 +1520,12 @@ export default function UploadPage() {
                         AI extracted
                       </span>
                     );
+                  } else if (analyzing && !submission.status) {
+                    return (
+                      <span className="text-xs bg-blue-100 text-blue-800 px-2 py-0.5 rounded font-medium">
+                        Running analyze
+                      </span>
+                    );
                   } else {
                     return (
                       <span className="text-xs bg-amber-100 text-amber-800 px-2 py-0.5 rounded font-medium">
@@ -1394,14 +1570,10 @@ export default function UploadPage() {
                         type="button"
                         onClick={async () => {
                           await loadPreviousSubmission(submission.jobId);
-                          // After loading a previous submission from the list, jump directly to Reviewer Mode
-                          localStorage.setItem(
-                            "recentJobIds",
-                            JSON.stringify([{ jobId: submission.jobId, fileName: submission.fileName }]),
-                          );
-                          navigate(`/issue-reviewer?jobId=${submission.jobId}`);
+                          // Load data to current page, showing "Analyze with Gemini" section
+                          // Don't navigate away - let user see the extraction results and choose to analyze
                         }}
-                        disabled={loading}
+                        disabled={loading || analyzing}
                         className="px-3 py-1.5 text-sm bg-sky-600 text-white rounded-md hover:bg-sky-700 disabled:opacity-50 disabled:cursor-not-allowed"
                       >
                         {loading ? "Loading..." : "Load"}
@@ -1473,7 +1645,7 @@ export default function UploadPage() {
                 Batch Queue ({batchQueue.filter(q => q.status === "completed").length}/{batchQueue.length} completed)
               </h2>
               <div className="flex gap-2">
-                {!batchProcessing && !batchPaused && (
+                {!batchProcessing && !batchPaused && batchQueue.filter(q => q.status === "completed").length < batchQueue.length && (
                   <button
                     type="button"
                     onClick={processBatch}
@@ -1771,12 +1943,12 @@ export default function UploadPage() {
                       <button
                         type="button"
                         onClick={handleAnalyzeMissingPages}
-                        disabled={analyzing}
+                        disabled={analyzing || postProcessing}
                         className="inline-flex items-center justify-center rounded-md
                                    bg-orange-600 px-3 py-1.5 text-xs font-medium text-white
                                    hover:bg-orange-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
                       >
-                        {analyzing ? `Analyzing ${getMissingPages.length} missing pages...` : `Analyze ${getMissingPages.length} Missing Page${getMissingPages.length > 1 ? 's' : ''}`}
+                        {analyzing ? `Analyzing ${getMissingPages.length} missing pages...` : postProcessing ? "Processing..." : `Analyze ${getMissingPages.length} Missing Page${getMissingPages.length > 1 ? 's' : ''}`}
                       </button>
                     </div>
                   )}
@@ -1796,24 +1968,24 @@ export default function UploadPage() {
                       <button
                         type="button"
                         onClick={handleRerunAnalysis}
-                        disabled={analyzing}
+                        disabled={analyzing || postProcessing}
                         className="inline-flex items-center justify-center rounded-md
                                    bg-emerald-600 px-4 py-2 text-sm font-medium text-white
                                    hover:bg-emerald-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
                       >
-                        {analyzing ? "Re-analyzing with Gemini…" : "Rerun Analysis with Gemini"}
+                        {analyzing ? "Re-analyzing with Gemini…" : postProcessing ? "Processing..." : "Rerun Analysis with Gemini"}
                       </button>
                     </>
                   ) : result && result.pages.length > 0 ? (
                     <button
                       type="button"
                       onClick={handleAnalyze}
-                      disabled={analyzing}
+                      disabled={analyzing || postProcessing}
                       className="inline-flex items-center justify-center rounded-md
                                  bg-emerald-600 px-4 py-2 text-sm font-medium text-white
                                  hover:bg-emerald-700 disabled:opacity-50 disabled:cursor-not-allowed"
                     >
-                      {analyzing ? "Analyzing with Gemini…" : "Analyze with Gemini"}
+                      {analyzing ? "Analyzing with Gemini…" : postProcessing ? "Processing..." : "Analyze with Gemini"}
                     </button>
                   ) : null}
                 </div>
@@ -1841,6 +2013,22 @@ export default function UploadPage() {
                 <p className="text-xs text-blue-700 mt-2">
                   Currently analyzing page {analyzingProgress.current} of {analyzingProgress.total}...
                 </p>
+              </div>
+            )}
+
+            {postProcessing && (
+              <div className="rounded-lg border border-amber-200 bg-amber-50 p-4">
+                <div className="flex items-center gap-3">
+                  <div className="animate-spin rounded-full h-5 w-5 border-b-2 border-amber-600"></div>
+                  <div className="flex-1">
+                    <p className="text-sm font-medium text-amber-900">
+                      正在处理分页分类和问题聚合...
+                    </p>
+                    <p className="text-xs text-amber-700 mt-1">
+                      Processing page classification and issue aggregation. Please wait...
+                    </p>
+                  </div>
+                </div>
               </div>
             )}
 
@@ -1954,6 +2142,28 @@ export default function UploadPage() {
                                       </span>
                                     </div>
                                   )}
+                                  {analysis.structured_analysis.ai_opportunities_info && (
+                                    <div>
+                                      <span className="font-medium text-emerald-800">AI Opportunities:</span>
+                                      <div className="mt-1 ml-2 space-y-1">
+                                        {analysis.structured_analysis.ai_opportunities_info.llm_summary && (
+                                          <div className="text-emerald-700">
+                                            <span className="font-medium">Summary:</span> {analysis.structured_analysis.ai_opportunities_info.llm_summary}
+                                          </div>
+                                        )}
+                                        {analysis.structured_analysis.ai_opportunities_info.raw_text_excerpt && (
+                                          <div className="text-emerald-600 italic">
+                                            <span className="font-medium">Content:</span> {analysis.structured_analysis.ai_opportunities_info.raw_text_excerpt.substring(0, 200)}
+                                            {analysis.structured_analysis.ai_opportunities_info.raw_text_excerpt.length > 200 ? "..." : ""}
+                                          </div>
+                                        )}
+                                        <div className="text-emerald-700">
+                                          <span className="font-medium">Relevance:</span> {analysis.structured_analysis.ai_opportunities_info.relevance_to_violations} |{" "}
+                                          <span className="font-medium">Specificity:</span> {analysis.structured_analysis.ai_opportunities_info.specificity.replace("_", " ")}
+                                        </div>
+                                      </div>
+                                    </div>
+                                  )}
                                 </div>
                               </>
                             ) : (
@@ -2027,6 +2237,49 @@ export default function UploadPage() {
           </div>
         )}
       </div>
+
+      {/* Navigation Confirmation Modal */}
+      {showNavigationConfirm && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
+          <div className="bg-white rounded-lg shadow-xl max-w-md w-full p-6">
+            <div className="flex items-center gap-3 mb-4">
+              <svg className="w-8 h-8 text-amber-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+              </svg>
+              <h3 className="text-lg font-semibold text-slate-900">Analysis in Progress</h3>
+            </div>
+            <p className="text-slate-700 mb-6">
+              The analysis is currently running. If you navigate away, the analysis will be terminated and the results will not be saved.
+            </p>
+            <p className="text-sm text-slate-600 mb-6 font-semibold">
+              Are you sure you want to leave this page?
+            </p>
+            <div className="flex justify-end gap-3">
+              <button
+                onClick={() => {
+                  setShowNavigationConfirm(false);
+                  setPendingNavigation(null);
+                }}
+                className="px-4 py-2 bg-slate-200 text-slate-700 rounded-md hover:bg-slate-300 text-sm font-semibold"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => {
+                  setShowNavigationConfirm(false);
+                  if (pendingNavigation) {
+                    pendingNavigation();
+                  }
+                  setPendingNavigation(null);
+                }}
+                className="px-4 py-2 bg-red-600 text-white rounded-md hover:bg-red-700 text-sm font-semibold"
+              >
+                Leave Page
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
