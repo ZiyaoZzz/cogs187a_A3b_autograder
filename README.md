@@ -33,6 +33,26 @@ This section is for instructors/TAs who want to run everything in the browser us
 - **1. Create a Codespace**
   - On the repo page click **Code → Codespaces → Create codespace on main**.
 
+- **2. Easiest way: run the helper script**
+
+  In the Codespaces terminal:
+
+  ```bash
+  cd /workspaces/cogs187a_A3b_autograder
+  chmod +x codespaces-start.sh   # first time only
+  ./codespaces-start.sh
+  ```
+
+  This will:
+  - Create/activate `.venv`
+  - Install Python + npm dependencies
+  - Start backend (port 8000) and frontend (Vite dev server) together
+  - Set `VITE_API_BASE` to `https://${CODESPACE_NAME}-8000.app.github.dev`
+
+  You still need to open the **Ports** panel once and set port **8000** to **Public**.
+
+- **Manual steps (if you prefer to do it yourself)**
+
 - **2. Start the backend (FastAPI)**
 
   ```bash
@@ -65,9 +85,9 @@ This section is for instructors/TAs who want to run everything in the browser us
 
 - **4. Common Codespaces issues**
   - **Red “Cannot connect to backend server” banner**  
-    - Check backend terminal是否还在运行、没有报错。  
-    - 确认 **Ports** 面板中 8000 端口是 **Public**。  
-    - 确认你启动前端时用的 `VITE_API_BASE` 和 8000 端口的 URL 完全一致（包括 `https://` 和结尾端口号）。
+    - Check that the backend terminal is still running and shows no errors.  
+    - Make sure port **8000** is **Public** in the Ports panel.  
+    - Confirm that the `VITE_API_BASE` value exactly matches the `https://…-8000.app.github.dev` URL (including `https://` and port).
 
 Once this is working, you can use the app exactly like in local mode: upload PDFs, run “Analyze with Gemini”, open Issue Reviewer, etc.
 
