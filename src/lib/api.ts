@@ -1,7 +1,10 @@
 // API utility functions and constants
-const API_BASE = "http://localhost:8000";
-
-export { API_BASE };
+// Prefer Vite env var (works in Codespaces / deployed), fall back to localhost for local dev
+export const API_BASE =
+  (typeof import.meta !== "undefined" &&
+    (import.meta as any).env &&
+    (import.meta as any).env.VITE_API_BASE) ||
+  "http://localhost:8000";
 
 async function parseError(response: Response): Promise<string> {
   try {
