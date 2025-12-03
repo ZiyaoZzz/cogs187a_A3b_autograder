@@ -1,0 +1,26 @@
+{
+    "name": "COGS 187A Autograder",
+    "image": "mcr.microsoft.com/devcontainers/python:3.10",
+    "features": {
+        "ghcr.io/devcontainers/features/node:1": {
+            "version": "18"
+        }
+    },
+    "forwardPorts": [
+        5173,
+        8000
+    ],
+    "postCreateCommand": "npm install && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt && echo '✅ Environment ready! Run \"npm start\" to begin.'",
+    "customizations": {
+        "vscode": {
+            "settings": {
+                "python.defaultInterpreterPath": ".venv/bin/python"
+            },
+            "extensions": [
+                "ms-python.python",
+                "dbaeumer.vscode-eslint",
+                "esbenp.prettier-vscode"
+            ]
+        }
+    }
+}

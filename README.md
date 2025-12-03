@@ -6,6 +6,8 @@ LLM-powered pipeline for grading heuristic-evaluation assignments. It ingests PD
 
 ## 🚀 TL;DR / Quick Start
 
+[![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/ZiyaoZzz/cogs187a_A3b_autograder)
+
 ```bash
 # clone and enter
 git clone https://github.com/ZiyaoZzz/cogs187a_A3b_autograder.git
