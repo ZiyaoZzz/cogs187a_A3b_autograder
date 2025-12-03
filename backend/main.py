@@ -23,14 +23,10 @@ app = FastAPI()
 # CORS configuration - allow requests from frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://localhost:3000",
-        "http://127.0.0.1:5173",
-        "http://127.0.0.1:3000",
-        "http://localhost:5174",  # Vite HMR port
-    ],
-    allow_credentials=True,
+    # Allow all origins so the app works in Codespaces / different ports.
+    # We are not using cookies, so it's safe to disable credentials here.
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
     allow_headers=["*"],
     expose_headers=["*"],

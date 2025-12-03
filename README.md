@@ -9,7 +9,7 @@ LLM-powered pipeline for grading heuristic-evaluation assignments. It ingests PD
 [![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/ZiyaoZzz/cogs187a_A3b_autograder)
 
 ```bash
-# clone and enter
+# clone and enter (local)
 git clone https://github.com/ZiyaoZzz/cogs187a_A3b_autograder.git
 cd cogs187a_A3b_autograder
 
@@ -23,6 +23,53 @@ Notes:
 - Stop everything with `Ctrl+C`.
 
 For screenshots and troubleshooting, see **[QUICK_START.md](./QUICK_START.md)**.
+
+---
+
+## 🧩 Running entirely in GitHub Codespaces
+
+This section is for instructors/TAs who want to run everything in the browser using Codespaces (no local installs).
+
+- **1. Create a Codespace**
+  - On the repo page click **Code → Codespaces → Create codespace on main**.
+
+- **2. Start the backend (FastAPI)**
+
+  ```bash
+  cd /workspaces/cogs187a_A3b_autograder
+  python -m venv .venv
+  source .venv/bin/activate          # Windows in Codespaces is rare; use the bash command above
+  pip install -r requirements.txt
+  cd backend
+  python -m uvicorn main:app --host 0.0.0.0 --port 8000
+  ```
+
+  - Open the **Ports** panel in the Codespaces UI.
+  - Find port **8000**, set Visibility to **Public**.
+  - Copy the URL that looks like `https://xxxx-8000.app.github.dev`.
+
+- **3. Start the frontend (Vite + React)**
+
+  Open a **second terminal** in the same Codespace:
+
+  ```bash
+  cd /workspaces/cogs187a_A3b_autograder
+  npm install
+
+  # Tell the frontend how to reach the backend
+  VITE_API_BASE="https://xxxx-8000.app.github.dev" npm run dev
+  ```
+
+  - When Vite finishes, it prints a URL like `https://xxxx-5173.app.github.dev`.
+  - Click that link (or open it in a new browser tab) – this is the main web UI.
+
+- **4. Common Codespaces issues**
+  - **Red “Cannot connect to backend server” banner**  
+    - Check backend terminal是否还在运行、没有报错。  
+    - 确认 **Ports** 面板中 8000 端口是 **Public**。  
+    - 确认你启动前端时用的 `VITE_API_BASE` 和 8000 端口的 URL 完全一致（包括 `https://` 和结尾端口号）。
+
+Once this is working, you can use the app exactly like in local mode: upload PDFs, run “Analyze with Gemini”, open Issue Reviewer, etc.
 
 ---
 
