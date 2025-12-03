@@ -733,7 +733,7 @@ export default function UploadPage() {
       const formData = new FormData();
       formData.append("file", fileToUpload);
 
-      const res = await fetch("http://localhost:8000/api/extract-heuristic-pages", {
+      const res = await fetch(`${API_BASE}/api/extract-heuristic-pages`, {
         method: "POST",
         body: formData,
       });
@@ -1030,7 +1030,7 @@ export default function UploadPage() {
             })
             .filter((p: any) => p.page_role === "heuristic_explainer");
           
-          const res = await fetch("http://localhost:8000/api/analyze-single-page", {
+          const res = await fetch(`${API_BASE}/api/analyze-single-page`, {
             method: "POST",
             headers: {
               "Content-Type": "application/json",
